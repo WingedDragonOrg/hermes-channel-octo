@@ -2,8 +2,11 @@
 Tests for hermes_octo_plugin.adapter — adapter initialization and config parsing.
 """
 
+import json
+from types import SimpleNamespace
+
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 from hermes_octo_plugin.adapter import (
     LRUCache,
     check_octo_requirements,
@@ -11,7 +14,7 @@ from hermes_octo_plugin.adapter import (
     DEFAULT_HISTORY_LIMIT,
     DEFAULT_HISTORY_PROMPT_TEMPLATE,
 )
-from hermes_octo_plugin.types import MessagePayload, MessageType
+from hermes_octo_plugin.types import ChannelType, MessagePayload, MessageType
 from tests.conftest import make_bare_adapter
 
 
@@ -179,6 +182,67 @@ class TestResolveContent:
         adapter = make_bare_adapter()
         result = adapter._resolve_content(payload)
         assert "[合并转发]" in result
+
+
+class TestInboundSlashCommands:
+    @pytest.mark.asyncio
+    async def test_group_self_mention_reaches_gateway_as_slash_command(self, monkeypatch):
+        import hermes_octo_plugin.adapter as adapter_module
+
+        adapter = make_bare_adapter()
+        adapter._robot_id = "xiaoaitongxue_bot"
+        adapter._uid_to_name = {
+            "xiaoaitongxue_bot": "小爱",
+            "user1": "董振兴",
+        }
+        adapter._member_map = {
+            "小爱": "xiaoaitongxue_bot",
+            "董振兴": "user1",
+        }
+        adapter._aes_key = b"unused"
+        adapter._aes_iv = b"unused"
+
+        payload = {
+            "type": int(MessageType.Text),
+            "content": "@小爱 /new",
+            "mention": {
+                "uids": ["xiaoaitongxue_bot"],
+                "entities": [
+                    {"uid": "xiaoaitongxue_bot", "offset": 0, "length": 3},
+                ],
+            },
+        }
+        monkeypatch.setattr(
+            adapter_module,
+            "aes_decrypt",
+            lambda *_args: json.dumps(payload, ensure_ascii=False).encode(),
+        )
+        monkeypatch.setattr(adapter, "_refresh_group_member_cache", AsyncMock())
+        monkeypatch.setattr(adapter, "_build_history_context", AsyncMock(return_value=""))
+        monkeypatch.setattr(adapter, "_ensure_group_md", AsyncMock())
+        monkeypatch.setattr(adapter, "_send_typing_safe", AsyncMock())
+        monkeypatch.setattr(
+            adapter,
+            "build_source",
+            MagicMock(return_value=SimpleNamespace()),
+        )
+        handle_message = AsyncMock()
+        monkeypatch.setattr(adapter, "handle_message", handle_message)
+
+        recv = SimpleNamespace(
+            message_id="m1",
+            message_seq=1,
+            from_uid="user1",
+            channel_id="group1",
+            channel_type=ChannelType.Group,
+            timestamp=0,
+            encrypted_payload=b"unused",
+        )
+        await adapter._handle_recv(recv)
+
+        event = handle_message.await_args.args[0]
+        assert event.text == "/new"
+        assert event.get_command() == "new"
 
 
 class TestCheckOctoRequirements:

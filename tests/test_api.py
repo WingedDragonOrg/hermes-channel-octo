@@ -28,6 +28,8 @@ from hermes_octo_plugin.api import (
     get_group_md,
     update_group_md,
     update_group,
+    list_threads,
+    list_thread_members,
     infer_content_type,
     parse_image_dimensions,
 )
@@ -631,3 +633,41 @@ class TestGetChannelMessages:
         assert len(messages) == 1
         assert messages[0]["content"] == "hello"
         assert messages[0]["from_uid"] == "user1"
+
+
+class TestThreadApi:
+    """Thread endpoints have returned both wrapped dicts and bare arrays."""
+
+    @pytest.mark.asyncio
+    async def test_list_threads_accepts_bare_array_response(self):
+        mock_session = AsyncMock()
+        mock_response = AsyncMock()
+        mock_response.ok = True
+        mock_response.text = AsyncMock(return_value='[{"short_id":"t1","name":"测试 octo"}]')
+        mock_response.json = AsyncMock(return_value=[{"short_id": "t1", "name": "测试 octo"}])
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=None)
+        mock_session.get = MagicMock(return_value=mock_response)
+
+        threads = await list_threads(
+            mock_session, "https://api.example.com", "token", group_no="g1",
+        )
+
+        assert threads == [{"short_id": "t1", "name": "测试 octo"}]
+
+    @pytest.mark.asyncio
+    async def test_list_thread_members_accepts_bare_array_response(self):
+        mock_session = AsyncMock()
+        mock_response = AsyncMock()
+        mock_response.ok = True
+        mock_response.text = AsyncMock(return_value='[{"uid":"u1","name":"董振兴"}]')
+        mock_response.json = AsyncMock(return_value=[{"uid": "u1", "name": "董振兴"}])
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=None)
+        mock_session.get = MagicMock(return_value=mock_response)
+
+        members = await list_thread_members(
+            mock_session, "https://api.example.com", "token", group_no="g1", short_id="t1",
+        )
+
+        assert members == [{"uid": "u1", "name": "董振兴"}]

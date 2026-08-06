@@ -38,6 +38,7 @@ from .mention import (
     convert_structured_mentions,
     extract_mention_uids,
     parse_structured_mentions,
+    strip_leading_self_mention_for_command,
 )
 from .protocol import (
     PROTO_VERSION,
@@ -2260,6 +2261,12 @@ class OctoAdapter(BasePlatformAdapter):
                 llm_content = convert_content_for_llm(
                     content, payload.mention, dict(self._member_map)
                 )
+        if is_group:
+            llm_content = strip_leading_self_mention_for_command(
+                llm_content,
+                bot_uid=self._robot_id,
+                bot_name=self._uid_to_name.get(self._robot_id, ""),
+            )
 
         # Build body with quote prefix
         body = (reply_text + "\n---\n" + llm_content) if reply_text else llm_content

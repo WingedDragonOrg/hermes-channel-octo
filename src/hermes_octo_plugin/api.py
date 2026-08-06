@@ -1381,6 +1381,10 @@ async def list_threads(
     )
     if not result:
         return []
+    if isinstance(result, list):
+        return result
+    if not isinstance(result, dict):
+        return []
     threads = result.get("threads")
     return threads if isinstance(threads, list) else []
 
@@ -1427,6 +1431,10 @@ async def list_thread_members(
         f"/v1/bot/groups/{_api_path_segment(group_no, 'group_no')}/threads/{_api_path_segment(short_id, 'short_id')}/members",
     )
     if not result:
+        return []
+    if isinstance(result, list):
+        return result
+    if not isinstance(result, dict):
         return []
     members = result.get("members")
     return members if isinstance(members, list) else []
