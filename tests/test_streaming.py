@@ -381,6 +381,7 @@ async def test_second_send_closes_prior_segment():
     """A new send() (e.g. next-segment first-frame) must NOT drop the
     prior in-progress segment — close it into segments[] first."""
     a = _make_adapter()
+    a._on_behalf_of = "grantor-1"
     a._chat_kind["chatA"] = ChannelType.Group
 
     with (
@@ -405,6 +406,7 @@ async def test_second_send_closes_prior_segment():
     assert edit_message.await_args.kwargs["content"] == (
         "**Headers:**- `Authorization: ...`"
     )
+    assert edit_message.await_args.kwargs["on_behalf_of"] == "grantor-1"
     state["flush_task"].cancel()
 
 
@@ -496,6 +498,7 @@ async def test_edit_server_message_uses_native_endpoint_and_accepts_finalize():
         "message_id": "9223372036854775807",
         "content": "updated",
         "finalize": True,
+        "on_behalf_of": None,
     }
 
 

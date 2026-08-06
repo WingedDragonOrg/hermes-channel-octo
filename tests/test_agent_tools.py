@@ -65,6 +65,7 @@ def _configured_adapter() -> SimpleNamespace:
     return SimpleNamespace(
         _api_url="https://octo.invalid",
         _bot_token="test-token",
+        on_behalf_of="grantor-1",
         _owner_uid="owner-uid",
         _known_group_ids={"group-1"},
         _group_md_cache={},
@@ -158,11 +159,9 @@ def _args_for(action: str) -> dict[str, object]:
     }
 
 
-def test_tool_schema_requires_accountable_requester_identity():
-    assert set(agent_tools.TOOL_SCHEMA["parameters"]["required"]) == {
-        "action",
-        "requester_uid",
-    }
+def test_tool_schema_uses_trusted_session_identity_without_a_model_claim():
+    assert set(agent_tools.TOOL_SCHEMA["parameters"]["required"]) == {"action"}
+    assert "requester_uid" not in agent_tools.TOOL_SCHEMA["parameters"]["properties"]
 
 
 @pytest.mark.parametrize(
@@ -183,15 +182,17 @@ def test_trusted_requester_comes_only_from_an_octo_session_context(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("action", agent_tools.ACTIONS)
-async def test_management_actions_fail_closed_without_requester_uid(action: str):
-    """Every management action requires an explicit accountable requester."""
+async def test_management_actions_fail_closed_without_trusted_session(action: str):
+    """Every management action requires a trusted Octo session requester."""
     with (
         patch.object(agent_tools, "_resolve_adapter", return_value=_configured_adapter()),
         patch.object(agent_tools, "_new_guarded_http_session", _NoIoSession),
     ):
-        result = json.loads(await _call_handler(_args_for(action)))
+        result = json.loads(await _call_handler(_args_for(action), trusted_uid=None))
 
-    assert result == {"error": f"action '{action}' requires requester_uid"}
+    assert result == {
+        "error": f"action '{action}' requires a trusted Octo session requester"
+    }
 
 
 @pytest.mark.asyncio
@@ -416,6 +417,7 @@ async def test_thread_send_does_not_bypass_owner_only_join_permission():
     assert result["ok"] is True
     join_thread.assert_not_awaited()
     send_message.assert_awaited_once()
+    assert send_message.await_args.kwargs["on_behalf_of"] == "grantor-1"
 
 
 @pytest.mark.asyncio
@@ -455,7 +457,7 @@ async def test_claimed_owner_uid_cannot_override_trusted_session_requester():
             )
         )
 
-    assert result == {"error": "requester_uid does not match trusted Octo session"}
+    assert "requires bot-owner privileges" in result["error"]
     update_group.assert_not_awaited()
 
 

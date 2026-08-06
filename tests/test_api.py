@@ -16,8 +16,8 @@ from hermes_octo_plugin.api import (
     send_read_receipt,
     stream_start,
     stream_end,
-    get_upload_credentials,
-    upload_file_to_cos,
+    get_upload_presign,
+    upload_file_to_presigned_url,
     upload_and_get_url,
     download_file,
     get_channel_messages,
@@ -153,7 +153,14 @@ class TestApiFailureTruth:
     @pytest.mark.parametrize(
         ("call", "kwargs"),
         [
-            (get_upload_credentials, {"filename": "report.pdf"}),
+            (
+                get_upload_presign,
+                {
+                    "filename": "report.pdf",
+                    "file_size": 7,
+                    "content_type": "application/pdf",
+                },
+            ),
             (get_group_info, {"group_no": "group-1"}),
         ],
     )
@@ -169,23 +176,20 @@ class TestApiFailureTruth:
         assert "secret-token-from-backend" not in str(exc_info.value)
 
     @pytest.mark.asyncio
-    async def test_cos_upload_error_never_exposes_response_body(self):
+    async def test_presigned_upload_error_never_exposes_response_body_or_url(self):
+        upload_url = "https://storage.example/upload?signature=secret"
         with pytest.raises(RuntimeError, match="HTTP 503") as exc_info:
-            await upload_file_to_cos(
+            await upload_file_to_presigned_url(
                 _FailedApiSession(),
-                credentials={
-                    "tmpSecretId": "secret-id",
-                    "tmpSecretKey": "secret-key",
-                    "sessionToken": "session-token",
-                },
-                bucket="bucket",
-                region="region",
-                key="object-key",
+                upload_url=upload_url,
+                download_url="https://cdn.example/file",
                 file_data=b"payload",
                 content_type="application/octet-stream",
             )
 
         assert "secret-token-from-backend" not in str(exc_info.value)
+        assert upload_url not in str(exc_info.value)
+        assert "signature=secret" not in str(exc_info.value)
 
     @pytest.mark.asyncio
     async def test_download_error_never_exposes_signed_source_url(self):
@@ -235,6 +239,22 @@ class TestApiFailureTruth:
 
         data, content_type, filename = await download_file(
             session, "http://10.0.0.8/report.bin"
+        )
+
+        assert data == b""
+        assert content_type == "application/octet-stream"
+        assert filename == "report.bin"
+        session.get.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_outbound_download_policy_accepts_private_media_sources(self):
+        session = MagicMock()
+        session.get = MagicMock(return_value=_SuccessfulDownloadResponse())
+
+        data, content_type, filename = await download_file(
+            session,
+            "http://10.0.0.8/report.bin",
+            enforce_host_safety=False,
         )
 
         assert data == b""
@@ -336,6 +356,43 @@ class TestSendIdentity:
         assert result.client_msg_no == "client-1"
 
     @pytest.mark.asyncio
+    async def test_text_send_accepts_and_returns_the_dedup_key_when_server_omits_it(self):
+        post_json = AsyncMock(return_value={"message_id": "message-1"})
+        with patch.object(api, "post_json", post_json):
+            result = await send_message(
+                MagicMock(),
+                "https://api.example.invalid",
+                "test-token",
+                "group-1",
+                ChannelType.Group,
+                "hello",
+                client_msg_no="dedup-1",
+                on_behalf_of="grantor-1",
+            )
+
+        assert post_json.await_args.args[4]["client_msg_no"] == "dedup-1"
+        assert post_json.await_args.args[4]["on_behalf_of"] == "grantor-1"
+        assert result.client_msg_no == "dedup-1"
+
+    @pytest.mark.asyncio
+    async def test_typing_indicator_uses_the_configured_sending_identity(self):
+        with patch.object(api, "post_json", AsyncMock()) as post_json:
+            await send_typing(
+                MagicMock(),
+                "https://api.example.invalid",
+                "test-token",
+                "group-1",
+                ChannelType.Group,
+                on_behalf_of="grantor-1",
+            )
+
+        assert post_json.await_args.args[4] == {
+            "channel_id": "group-1",
+            "channel_type": ChannelType.Group,
+            "on_behalf_of": "grantor-1",
+        }
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("response", [None, {}, {"message_seq": 7}])
     async def test_send_rejects_success_response_without_message_id(self, response):
         with patch.object(api, "post_json", AsyncMock(return_value=response)):
@@ -361,6 +418,7 @@ class TestSendIdentity:
                 message_id="9223372036854775807",
                 content="updated",
                 finalize=True,
+                on_behalf_of="grantor-1",
             )
 
         path = post_json.await_args.args[3]
@@ -371,6 +429,7 @@ class TestSendIdentity:
             "channel_id": "group-1",
             "channel_type": ChannelType.Group,
             "content_edit": '{"type": 1, "content": "updated"}',
+            "on_behalf_of": "grantor-1",
         }
         assert "finalize" not in body
 
@@ -499,20 +558,19 @@ class TestFunctionSignatures:
         assert "channel_id" in params
         assert "channel_type" in params
 
-    def test_get_upload_credentials_signature(self):
-        sig = inspect.signature(get_upload_credentials)
-        params = list(sig.parameters.keys())
-        assert "filename" in params
+    def test_get_upload_presign_signature(self):
+        params = inspect.signature(get_upload_presign).parameters
+        assert {"filename", "file_size", "content_type"} <= set(params)
 
-    def test_upload_file_to_cos_signature(self):
-        sig = inspect.signature(upload_file_to_cos)
-        params = list(sig.parameters.keys())
-        assert "credentials" in params
-        assert "bucket" in params
-        assert "region" in params
-        assert "key" in params
-        assert "file_data" in params
-        assert "content_type" in params
+    def test_upload_file_to_presigned_url_signature(self):
+        params = inspect.signature(upload_file_to_presigned_url).parameters
+        assert {
+            "upload_url",
+            "download_url",
+            "file_data",
+            "content_type",
+            "content_disposition",
+        } <= set(params)
 
     def test_get_channel_messages_signature(self):
         sig = inspect.signature(get_channel_messages)

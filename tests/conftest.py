@@ -3,6 +3,7 @@ Shared pytest configuration and fixtures.
 """
 
 import asyncio
+from collections import OrderedDict
 import weakref
 
 import pytest
@@ -42,7 +43,10 @@ def make_bare_adapter():
         NAME_CACHE_MAX_SIZE,
         OctoAdapter,
         PING_MAX_RETRY,
+        UNKNOWN_MESSAGE_TYPE_TELEMETRY_CAP,
     )
+    from hermes_octo_plugin import cards
+    from hermes_octo_plugin.card_events import CardSessionRegistry
 
     a = object.__new__(OctoAdapter)
     # Name resolution / membership maps
@@ -67,6 +71,14 @@ def make_bare_adapter():
     a._active_streams = {}
     a._stream_locks = weakref.WeakValueDictionary()
     a._stream_creation_tasks = set()
+    a._progress_tasks = set()
+    a._gateway_loop = None
+    a._event_poller = None
+    a._event_task = None
+    a._card_sessions = CardSessionRegistry()
+    a._card_profile_cache = cards.CardProfileCache()
+    a._unknown_message_type_counts = OrderedDict()
+    a._unknown_message_type_log_budget = UNKNOWN_MESSAGE_TYPE_TELEMETRY_CAP
     a._disconnecting = False
     # Connection / lifecycle state
     a._ws = None
@@ -89,7 +101,9 @@ def make_bare_adapter():
     # Identity / config (callers override as needed)
     a._api_url = ""
     a._cdn_url = ""
+    a._ws_url = ""
     a._bot_token = ""
+    a._on_behalf_of = ""
     a._robot_id = ""
     a._owner_uid = ""
     a._history_limit = DEFAULT_HISTORY_LIMIT
@@ -99,6 +113,9 @@ def make_bare_adapter():
     a._stream_threshold = 500
     a._heartbeat_interval_s = float(HEARTBEAT_INTERVAL)
     a._ping_max_retry = int(PING_MAX_RETRY)
+    a._event_poll_interval_s = 2.0
+    a._event_poll_wait_s = 25
+    a._event_poll_limit = 50
     return a
 
 

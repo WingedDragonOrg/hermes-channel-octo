@@ -12,10 +12,11 @@ import random
 import re
 import socket
 import time
+import uuid
 import weakref
 from collections import OrderedDict
-from collections.abc import Coroutine
-from typing import Any
+from collections.abc import Callable, Coroutine
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import aiohttp
@@ -32,7 +33,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 
-from . import api
+from . import api, cards
 from .mention import (
     convert_content_for_llm,
     convert_structured_mentions,
@@ -63,12 +64,33 @@ from .types import (
     RICH_TEXT_BLOCK_IMAGE,
     RICH_TEXT_BLOCK_TEXT,
     RICH_TEXT_IMAGE_PLACEHOLDER,
+    SendMessageResult,
 )
+
+if TYPE_CHECKING:
+    from .card_events import CardAction, CardSession
 from .types import (
     MessageType as OctoMessageType,
 )
 
 logger = logging.getLogger(__name__)
+
+def _delivery_result(result: SendMessageResult) -> SendResult:
+    if result.message_id is None:
+        return SendResult(
+            success=False,
+            error="Octo send response missing message_id",
+        )
+    raw_response: dict[str, object] = {"message_id": result.message_id}
+    if result.message_seq is not None:
+        raw_response["message_seq"] = result.message_seq
+    if result.client_msg_no is not None:
+        raw_response["client_msg_no"] = result.client_msg_no
+    return SendResult(
+        success=True,
+        message_id=result.message_id,
+        raw_response=raw_response,
+    )
 
 
 def _infer_image_mime(url: str) -> str:
@@ -233,6 +255,10 @@ MEDIA_TEMP_DIR = "/tmp/octo-media"
 MEDIA_DOWNLOAD_MAX_BYTES = 20 * 1024 * 1024  # 20 MB
 MEDIA_DOWNLOAD_TIMEOUT_S = 120.0
 MEDIA_TEMP_RETENTION_S = 60 * 60  # 1 hour
+# Unknown protocol types are tracked by numeric code only. Both retained
+# counters and emitted diagnostics are capped so hostile inputs cannot grow
+# process memory or logs, and raw future-protocol payloads are never dumped.
+UNKNOWN_MESSAGE_TYPE_TELEMETRY_CAP = 32
 # GROUP.md / THREAD.md disk cache. Survives gateway restarts so the first @
 # after a restart doesn't pay the round-trip; the in-memory cache primes from
 # disk during startup prefetch, and writes happen on every ensure / refresh.
@@ -467,10 +493,16 @@ def _new_guarded_http_session(*configured_urls: str) -> aiohttp.ClientSession:
     return aiohttp.ClientSession(connector=connector)
 
 
-def _validate_octo_url(url: str, name: str) -> str:
+def _validate_octo_endpoint(
+    url: str,
+    name: str,
+    *,
+    schemes: tuple[str, ...],
+    scheme_label: str,
+) -> str:
     parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError(f"{name} must be http(s): got {parsed.scheme!r}")
+    if parsed.scheme not in schemes:
+        raise ValueError(f"{name} must be {scheme_label}: got {parsed.scheme!r}")
     if not parsed.netloc:
         raise ValueError(f"{name} missing host: {url!r}")
     hostname = (parsed.hostname or "").lower().rstrip(".")
@@ -487,6 +519,24 @@ def _validate_octo_url(url: str, name: str) -> str:
             f"(SSRF guard). Set OCTO_ALLOW_PRIVATE_HOSTS=true for dev/self-hosted setups."
         )
     return url
+
+
+def _validate_octo_url(url: str, name: str) -> str:
+    return _validate_octo_endpoint(
+        url,
+        name,
+        schemes=("http", "https"),
+        scheme_label="http(s)",
+    )
+
+
+def _validate_octo_ws_url(url: str, name: str = "OCTO_WS_URL") -> str:
+    return _validate_octo_endpoint(
+        url,
+        name,
+        schemes=("ws", "wss"),
+        scheme_label="ws(s)",
+    )
 
 
 def check_octo_requirements() -> bool:
@@ -630,6 +680,18 @@ async def _standalone_send(
         or getattr(pconfig, "token", "")
         or os.getenv("OCTO_BOT_TOKEN", "")
     )
+    configured_on_behalf_of = (
+        extra.get("on_behalf_of")
+        if "on_behalf_of" in extra
+        else os.getenv("OCTO_ON_BEHALF_OF")
+    )
+    if configured_on_behalf_of is not None and not isinstance(
+        configured_on_behalf_of, str
+    ):
+        return {"error": "on_behalf_of must be a string"}
+    on_behalf_of = (
+        configured_on_behalf_of.strip() if configured_on_behalf_of else None
+    )
     if not api_url or not bot_token:
         return {"error": "OCTO_API_URL and OCTO_BOT_TOKEN must be configured"}
 
@@ -658,6 +720,7 @@ async def _standalone_send(
             structured = _parse_sm(message)
             if structured:
                 send_content, send_entities, send_uids = _convert_sm(message, structured)
+            client_msg_no = str(uuid.uuid4())
             send_result = await _octo_send(
                 session, api_url, bot_token,
                 channel_id=chat_id,
@@ -669,10 +732,17 @@ async def _standalone_send(
                 content=send_content,
                 mention_uids=send_uids,
                 mention_entities=send_entities,
+                client_msg_no=client_msg_no,
+                on_behalf_of=on_behalf_of,
             )
-        result = {"success": True}
-        if getattr(send_result, "message_id", None):
-            result["message_id"] = send_result.message_id
+        result = {
+            "success": True,
+            "message_id": send_result.message_id,
+        }
+        if send_result.message_seq is not None:
+            result["message_seq"] = send_result.message_seq
+        if send_result.client_msg_no is not None:
+            result["client_msg_no"] = send_result.client_msg_no
         return result
     except Exception as e:  # pragma: no cover — best-effort cron path
         # Use redact_log on the message text (force=True via our alias) so
@@ -725,6 +795,13 @@ class OctoAdapter(BasePlatformAdapter):
         extra = config.extra or {}
         self._api_url: str = extra.get("api_url") or os.getenv("OCTO_API_URL", "")
         self._bot_token: str = extra.get("bot_token") or os.getenv("OCTO_BOT_TOKEN", "")
+        self._ws_url: str = extra.get("ws_url") or os.getenv("OCTO_WS_URL", "")
+        configured_on_behalf_of = extra.get("on_behalf_of")
+        if configured_on_behalf_of is None:
+            configured_on_behalf_of = os.getenv("OCTO_ON_BEHALF_OF", "")
+        if not isinstance(configured_on_behalf_of, str):
+            raise ValueError("on_behalf_of must be a string")
+        self._on_behalf_of = configured_on_behalf_of.strip()
         # Optional CDN base URL. When set, _build_media_url returns
         # <cdn_url>/<relative_path> instead of <api_url>/file/<relative_path>
         # — lets the agent fetch media from a public-read CDN without
@@ -735,6 +812,8 @@ class OctoAdapter(BasePlatformAdapter):
             _validate_octo_url(self._api_url, "OCTO_API_URL")
         if self._cdn_url:
             _validate_octo_url(self._cdn_url, "OCTO_CDN_URL")
+        if self._ws_url:
+            _validate_octo_ws_url(self._ws_url)
 
         # Connection state
         self._ws: websockets.WebSocketClientProtocol | None = None
@@ -755,6 +834,14 @@ class OctoAdapter(BasePlatformAdapter):
         self._prefetch_task: asyncio.Task[Any] | None = None
         self._reconnect_task: asyncio.Task[Any] | None = None
         self._lifecycle_lock = asyncio.Lock()
+        self._gateway_loop: asyncio.AbstractEventLoop | None = None
+        self._progress_tasks: set[asyncio.Task[Any]] = set()
+        from .card_events import CardSessionRegistry
+
+        self._event_poller: Any | None = None
+        self._event_task: asyncio.Task[Any] | None = None
+        self._card_sessions = CardSessionRegistry()
+        self._card_profile_cache = cards.CardProfileCache()
 
         # Cache activity tracker: channel_id → last-touched monotonic seconds.
         # _cleanup_caches() uses this to age out stale per-channel state so
@@ -849,6 +936,8 @@ class OctoAdapter(BasePlatformAdapter):
 
         # Group history: channel_id → list of {sender, body, mention, timestamp}
         self._group_histories: dict[str, list[dict[str, Any]]] = {}
+        self._unknown_message_type_counts: OrderedDict[int, int] = OrderedDict()
+        self._unknown_message_type_log_budget = UNKNOWN_MESSAGE_TYPE_TELEMETRY_CAP
 
         # Outbound channel-type memory: chat_id → ChannelType.
         # When hermes calls send(chat_id, ...) it doesn't know whether the
@@ -894,6 +983,23 @@ class OctoAdapter(BasePlatformAdapter):
         self._ping_max_retry: int = int(
             extra.get("ping_max_retry", PING_MAX_RETRY)
         )
+        event_interval = extra.get("event_poll_interval_s")
+        if event_interval is None:
+            event_interval = os.getenv("OCTO_EVENT_POLL_INTERVAL_S", "2.0")
+        event_wait = extra.get("event_poll_wait_s")
+        if event_wait is None:
+            event_wait = os.getenv("OCTO_EVENT_POLL_WAIT_S", "25")
+        event_limit = extra.get("event_poll_limit")
+        if event_limit is None:
+            event_limit = os.getenv("OCTO_EVENT_POLL_LIMIT", "50")
+        self._event_poll_interval_s = float(event_interval)
+        self._event_poll_wait_s = int(event_wait)
+        self._event_poll_limit = int(event_limit)
+
+    @property
+    def on_behalf_of(self) -> str | None:
+        """Trusted configured grantor identity for outbound delivery."""
+        return self._on_behalf_of or None
 
     @property
     def name(self) -> str:
@@ -903,6 +1009,114 @@ class OctoAdapter(BasePlatformAdapter):
 
     def _new_http_session(self) -> aiohttp.ClientSession:
         return _new_guarded_http_session(self._api_url, self._cdn_url)
+
+    def _schedule_card_progress(
+        self,
+        factory: Callable[[], Coroutine[Any, Any, None]],
+    ) -> bool:
+        """Create an owned progress task on the adapter's gateway loop."""
+        loop = self._gateway_loop
+        if self._disconnecting or loop is None or loop.is_closed():
+            return False
+
+        def spawn() -> None:
+            if self._disconnecting:
+                return
+            try:
+                task = loop.create_task(factory())
+            except Exception:
+                logger.debug("[%s] progress task creation failed", self.name, exc_info=True)
+                return
+            self._progress_tasks.add(task)
+
+            def done(completed: asyncio.Task[Any]) -> None:
+                self._progress_tasks.discard(completed)
+                if not completed.cancelled():
+                    try:
+                        completed.exception()
+                    except Exception:
+                        logger.debug(
+                            "[%s] progress task failed",
+                            self.name,
+                            exc_info=True,
+                        )
+
+            task.add_done_callback(done)
+
+        try:
+            loop.call_soon_threadsafe(spawn)
+        except RuntimeError:
+            return False
+        return True
+
+    def _register_card_session(self, session: CardSession) -> None:
+        self._card_sessions.register(session)
+
+    async def _handle_card_action_event(self, action: CardAction) -> None:
+        from .card_events import (
+            dispatch_card_action_event,
+            handle_card_action,
+        )
+
+        status = await handle_card_action(
+            self._card_sessions,
+            action,
+            lambda session, claimed: dispatch_card_action_event(
+                self,
+                session,
+                claimed,
+            ),
+        )
+        if status == "dead_letter":
+            logger.warning(
+                "[%s] card action dispatch exhausted retries event_id=%d",
+                self.name,
+                action.event_id,
+            )
+
+    def _start_card_event_poller(self) -> None:
+        if (
+            self._disconnecting
+            or self._http_session is None
+            or self._registration is None
+            or (self._event_task is not None and not self._event_task.done())
+        ):
+            return
+        from .card_events import EventPoller, FileEventCursorStore
+
+        cursor_store = FileEventCursorStore(owner_id=self._registration.robot_id)
+        self._event_poller = EventPoller(
+            session=self._http_session,
+            api_url=self._api_url,
+            bot_token=self._bot_token,
+            cursor_store=cursor_store,
+            on_card_action=self._handle_card_action_event,
+            interval_seconds=self._event_poll_interval_s,
+            wait_seconds=self._event_poll_wait_s,
+            limit=self._event_poll_limit,
+        )
+        self._event_task = self._event_poller.start()
+
+        def done(completed: asyncio.Task[Any]) -> None:
+            if completed.cancelled():
+                return
+            try:
+                completed.result()
+            except Exception:
+                logger.error(
+                    "[%s] card event poller stopped unexpectedly",
+                    self.name,
+                    exc_info=True,
+                )
+
+        self._event_task.add_done_callback(done)
+
+    def _stop_card_event_poller(self) -> None:
+        poller = self._event_poller
+        self._event_poller = None
+        self._event_task = None
+        if poller is not None:
+            poller.stop()
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Serialize public connection ownership across connect/reconnect/close."""
@@ -916,6 +1130,7 @@ class OctoAdapter(BasePlatformAdapter):
         state is tracked internally.
         """
         del is_reconnect
+        self._gateway_loop = asyncio.get_running_loop()
         if not self._api_url or not self._bot_token:
             logger.error("[%s] OCTO_API_URL and OCTO_BOT_TOKEN must be set", self.name)
             return False
@@ -977,7 +1192,8 @@ class OctoAdapter(BasePlatformAdapter):
             logger.error("[%s] Bot registration failed: %s", self.name, redact_log(str(e)))
             raise
 
-        ws_url = self._registration.ws_url
+        ws_url = self._ws_url or self._registration.ws_url
+        _validate_octo_ws_url(ws_url)
         try:
             self._ws = await websockets.connect(
                 ws_url,
@@ -1068,6 +1284,7 @@ class OctoAdapter(BasePlatformAdapter):
         self._http_heartbeat_disabled = False
         await self._start_heartbeat_task()
         self._recv_task = asyncio.create_task(self._receive_loop())
+        self._start_card_event_poller()
         # Only one cleanup loop per adapter lifetime; survives reconnects.
         if self._cache_cleanup_task is None or self._cache_cleanup_task.done():
             self._cache_cleanup_task = asyncio.create_task(self._cache_cleanup_loop())
@@ -1098,6 +1315,13 @@ class OctoAdapter(BasePlatformAdapter):
     async def _finalize_disconnect_resources(self) -> None:
         """Cancel owned tasks and close transports exactly once."""
         current_task = asyncio.current_task()
+        try:
+            from .card_progress import cancel_adapter_progress
+
+            cancel_adapter_progress(self)
+        except Exception:
+            logger.debug("[%s] progress state cleanup failed", self.name, exc_info=True)
+        event_task = self._event_task
         stream_watchdogs = [
             state.get("flush_task")
             for state in self._active_streams.values()
@@ -1110,8 +1334,10 @@ class OctoAdapter(BasePlatformAdapter):
             self._recv_task,
             self._cache_cleanup_task,
             self._prefetch_task,
+            event_task,
             *stream_watchdogs,
             *self._stream_creation_tasks,
+            *self._progress_tasks,
         ]
         for task in owned_tasks:
             if task and task is not current_task and not task.done():
@@ -1129,11 +1355,12 @@ class OctoAdapter(BasePlatformAdapter):
         self._recv_task = None
         self._cache_cleanup_task = None
         self._prefetch_task = None
+        self._event_task = None
         for state in self._active_streams.values():
             state["flush_task"] = None
         self._active_streams.clear()
         self._stream_creation_tasks.clear()
-
+        self._progress_tasks.clear()
         ws, self._ws = self._ws, None
         if ws:
             try:
@@ -1169,6 +1396,8 @@ class OctoAdapter(BasePlatformAdapter):
         self._need_reconnect = False
         self._disconnecting = True
         cancellation: asyncio.CancelledError | None = None
+        if self._event_poller is not None:
+            self._event_poller.stop()
         reconnect_task = self._reconnect_task
         current = asyncio.current_task()
         if reconnect_task and reconnect_task is not current and not reconnect_task.done():
@@ -1206,6 +1435,8 @@ class OctoAdapter(BasePlatformAdapter):
         self._disconnecting = True
         self._connected = False
         cancellation: asyncio.CancelledError | None = None
+        if self._event_poller is not None:
+            self._event_poller.stop()
 
         try:
             creation_tasks = [
@@ -2039,20 +2270,15 @@ class OctoAdapter(BasePlatformAdapter):
             payload=payload,
         )
 
-        # [DIAG] dump raw recv to find why some DMs early-return at empty content
         logger.debug(
-            "[%s] [DIAG recv] from_uid=%r channel_id=%r channel_type=%r "
-            "payload.type=%r content=%r url=%r name=%r event=%r extra_keys=%r",
+            "[%s] recv channel_type=%r payload_type=%r "
+            "has_content=%s has_media_url=%s has_event=%s",
             self.name,
-            recv.from_uid,
-            recv.channel_id,
             recv.channel_type,
             payload.type,
-            payload.content,
-            payload.url,
-            payload.name,
-            payload.event,
-            list(payload_dict.keys()),
+            bool(payload.content or payload.plain or payload.blocks),
+            bool(payload.url),
+            bool(payload.event),
         )
 
         # Skip self-messages
@@ -2223,23 +2449,7 @@ class OctoAdapter(BasePlatformAdapter):
                 or "unknown"
             )
             reply_payload = getattr(payload.reply, "payload", None)
-            reply_content: str = ""
-            if isinstance(reply_payload, dict):
-                raw = reply_payload.get("content")
-                if isinstance(raw, str):
-                    # Legacy string-typed content (Text and older RichText):
-                    # keep the existing fast path.
-                    reply_content = raw
-                elif raw is not None:
-                    # Non-str content (e.g. RichText(=14) block array) —
-                    # never interpolate a Python list into the LLM prompt.
-                    # Reparse via MessagePayload so the same type-aware
-                    # renderer used for a live message renders the quote.
-                    try:
-                        quoted = MessagePayload.from_dict(reply_payload)
-                        reply_content = self._resolve_content(quoted)
-                    except Exception:
-                        reply_content = ""
+            reply_content = self._resolve_quoted_message_text(reply_payload)
             if reply_content:
                 reply_text = f"[Quoted message from {reply_from}]: {reply_content}"
 
@@ -2756,6 +2966,15 @@ class OctoAdapter(BasePlatformAdapter):
                 pass
             return None
 
+    def _resolve_quoted_message_text(self, reply_payload: object) -> str:
+        """Render quoted content through the same type-aware inbound policy."""
+        if not isinstance(reply_payload, dict):
+            return ""
+        try:
+            return self._resolve_content(MessagePayload.from_dict(reply_payload))
+        except (TypeError, ValueError):
+            return ""
+
     def _resolve_inner_message_text(self, inner: dict[str, Any]) -> str:
         """Render a single inner message inside a MultipleForward payload.
 
@@ -2787,6 +3006,9 @@ class OctoAdapter(BasePlatformAdapter):
             name = payload.get("name")
             label = f"[文件: {name}]" if name else "[文件]"
             return f"{label}\n{url}".strip() if url else label
+        if msg_type == t.InteractiveCard:
+            plain = payload.get("plain")
+            return plain if isinstance(plain, str) and plain else "[卡片]"
         if msg_type == t.MultipleForward:
             # Nested forward — recurse
             return self._resolve_multiple_forward_text(payload)
@@ -2795,7 +3017,10 @@ class OctoAdapter(BasePlatformAdapter):
             # same helper so plain/blocks precedence stays consistent.
             text, _ = self._resolve_rich_text_content(payload)
             return text or "[图文消息]"
-        return content or "[消息]"
+        if msg_type is not None:
+            message_type = self._record_unknown_message_type(msg_type)
+            return f"[未知消息类型: {message_type}]"
+        return content if isinstance(content, str) and content else "[消息]"
 
     def _resolve_multiple_forward_text(self, payload: Any) -> str:
         """Expand a MultipleForward payload into readable text.
@@ -2937,6 +3162,30 @@ class OctoAdapter(BasePlatformAdapter):
                     out.append(txt)
         return "".join(out)
 
+    def _record_unknown_message_type(self, raw_type: object) -> int:
+        message_type = (
+            raw_type
+            if isinstance(raw_type, int) and not isinstance(raw_type, bool)
+            else -1
+        )
+        counts = self._unknown_message_type_counts
+        previous = counts.pop(message_type, 0)
+        count = min(previous + 1, 2_147_483_647)
+        counts[message_type] = count
+        while len(counts) > UNKNOWN_MESSAGE_TYPE_TELEMETRY_CAP:
+            counts.popitem(last=False)
+
+        budget = self._unknown_message_type_log_budget
+        if budget > 0 and (count == 1 or count & (count - 1) == 0):
+            logger.warning(
+                "[%s] Unknown Octo message type=%d count=%d",
+                self.name,
+                message_type,
+                count,
+            )
+            self._unknown_message_type_log_budget = budget - 1
+        return message_type
+
     def _resolve_content(self, payload: MessagePayload) -> str:
         """Resolve message payload to display text.
 
@@ -2975,14 +3224,15 @@ class OctoAdapter(BasePlatformAdapter):
         elif payload.type == OctoMessageType.InteractiveCard:
             # ``plain`` is the server-provided display summary.  Never parse
             # the card tree here: it may contain internal UI/state fields.
-            return payload.plain or payload.content or "[卡片]"
+            return payload.plain or "[卡片]"
         elif payload.type == OctoMessageType.MultipleForward:
             return self._resolve_multiple_forward_text(payload)
         elif payload.type == OctoMessageType.RichText:
             text, _ = self._resolve_rich_text_content(payload)
             return text or "[图文消息]"
         else:
-            return payload.content or f"[未知消息类型: {payload.type}]"
+            message_type = self._record_unknown_message_type(payload.type)
+            return f"[未知消息类型: {message_type}]"
 
     async def _send_read_receipt_safe(
         self, channel_id: str, channel_type: ChannelType, message_ids: list[str]
@@ -3006,6 +3256,7 @@ class OctoAdapter(BasePlatformAdapter):
             await api.send_typing(
                 self._http_session, self._api_url, self._bot_token,
                 channel_id=outbound_channel_id, channel_type=channel_type,
+                on_behalf_of=self.on_behalf_of,
             )
         except Exception as e:
             logger.debug("[%s] Typing indicator failed: %s", self.name, e)
@@ -3556,6 +3807,7 @@ class OctoAdapter(BasePlatformAdapter):
                 message_id=message_id,
                 content=body,
                 finalize=finalize,
+                on_behalf_of=self.on_behalf_of,
             )
         except Exception as exc:
             logger.error(
@@ -3623,6 +3875,7 @@ class OctoAdapter(BasePlatformAdapter):
                     message_id=message_id,
                     content=content,
                     finalize=finalize,
+                    on_behalf_of=self.on_behalf_of,
                 )
             except Exception as exc:
                 logger.error(
@@ -3846,30 +4099,21 @@ class OctoAdapter(BasePlatformAdapter):
                     send_content, send_entities, send_uids = convert_structured_mentions(
                         chunk, structured,
                     )
+                client_msg_no = str(uuid.uuid4())
                 last_send_result = await api.send_message(
                     self._http_session, self._api_url, self._bot_token,
                     channel_id=outbound_channel_id, channel_type=channel_type,
                     content=send_content, reply_msg_id=reply_to,
                     mention_uids=send_uids, mention_entities=send_entities,
+                    client_msg_no=client_msg_no,
+                    on_behalf_of=self.on_behalf_of,
                 )
-            message_id = getattr(last_send_result, "message_id", None)
-            if not message_id:
+            if last_send_result is None:
                 return SendResult(
                     success=False,
                     error="Octo send response missing message_id",
                 )
-            raw_response = None
-            if last_send_result is not None:
-                raw_response = {
-                    field: value
-                    for field in ("message_id", "message_seq", "client_msg_no")
-                    if (value := getattr(last_send_result, field, None)) is not None
-                }
-            return SendResult(
-                success=True,
-                message_id=message_id,
-                raw_response=raw_response,
-            )
+            return _delivery_result(last_send_result)
         except Exception as e:
             logger.error("[%s] Send failed: %s", self.name, e)
             return SendResult(
@@ -3885,6 +4129,32 @@ class OctoAdapter(BasePlatformAdapter):
             chat_id, metadata if isinstance(metadata, dict) else None
         )
         await self._send_typing_safe(chat_id, channel_type)
+
+
+    async def _load_outbound_media(
+        self,
+        source: str,
+    ) -> tuple[bytes, str, str]:
+        """Load outbound media with the same URL and size contract as OpenClaw."""
+        if source.startswith("data:"):
+            return api.decode_media_data_uri(
+                source,
+                max_size=api.MAX_OUTBOUND_MEDIA_BYTES,
+            )
+        if source.startswith(("http://", "https://")):
+            async with aiohttp.ClientSession() as download_session:
+                return await api.download_file(
+                    download_session,
+                    source,
+                    max_size=api.MAX_OUTBOUND_MEDIA_BYTES,
+                    enforce_host_safety=False,
+                )
+        file_data, filename = await asyncio.to_thread(
+            api.read_local_media,
+            source,
+            max_size=api.MAX_OUTBOUND_MEDIA_BYTES,
+        )
+        return file_data, api.infer_content_type(filename), filename
 
     async def send_image(
         self,
@@ -3904,26 +4174,24 @@ class OctoAdapter(BasePlatformAdapter):
                 media_name="image",
             )
             outbound_channel_id = self._outbound_channel_id(chat_id, channel_type)
-            final_url = image_url
             width = media_metadata.get("width")
             height = media_metadata.get("height")
-            if image_url.startswith(("http://", "https://")):
-                try:
-                    file_data, content_type, filename = await api.download_file(
-                        self._http_session, image_url, max_size=20 * 1024 * 1024
-                    )
-                    dims = api.parse_image_dimensions(file_data, content_type)
-                    if dims:
-                        parsed_width, parsed_height = dims
-                        width = width if width is not None else parsed_width
-                        height = height if height is not None else parsed_height
-                    final_url = await api.upload_and_get_url(
-                        self._http_session, self._api_url, self._bot_token,
-                        filename, file_data, content_type,
-                    )
-                except Exception as upload_err:
-                    logger.warning("[%s] Image upload failed, using URL directly: %s",
-                                   self.name, upload_err)
+            file_data, content_type, filename = await self._load_outbound_media(
+                image_url
+            )
+            dims = api.parse_image_dimensions(file_data, content_type)
+            if dims:
+                parsed_width, parsed_height = dims
+                width = width if width is not None else parsed_width
+                height = height if height is not None else parsed_height
+            final_url = await api.upload_and_get_url(
+                self._http_session,
+                self._api_url,
+                self._bot_token,
+                filename,
+                file_data,
+                content_type,
+            )
 
             # With a caption AND known dimensions, ship as a single
             # RichText(=14) payload so the image and caption arrive
@@ -3953,7 +4221,8 @@ class OctoAdapter(BasePlatformAdapter):
                         height=height,
                     ),
                 ]
-                await api.send_rich_text_message(
+                client_msg_no = str(uuid.uuid4())
+                send_result = await api.send_rich_text_message(
                     self._http_session, self._api_url, self._bot_token,
                     channel_id=outbound_channel_id, channel_type=channel_type,
                     blocks=blocks,
@@ -3961,24 +4230,32 @@ class OctoAdapter(BasePlatformAdapter):
                     mention_uids=send_uids,
                     mention_entities=send_entities,
                     reply_msg_id=reply_to,
+                    client_msg_no=client_msg_no,
+                    on_behalf_of=self.on_behalf_of,
                 )
-                return SendResult(success=True)
+                return _delivery_result(send_result)
 
-            await api.send_media_message(
+            media_client_msg_no = str(uuid.uuid4())
+            send_result = await api.send_media_message(
                 self._http_session, self._api_url, self._bot_token,
                 channel_id=outbound_channel_id, channel_type=channel_type,
                 msg_type=OctoMessageType.Image, url=final_url,
                 width=width, height=height,
                 reply_msg_id=reply_to,
+                client_msg_no=media_client_msg_no,
+                on_behalf_of=self.on_behalf_of,
             )
             if caption:
+                caption_client_msg_no = str(uuid.uuid4())
                 await api.send_message(
                     self._http_session, self._api_url, self._bot_token,
                     channel_id=outbound_channel_id, channel_type=channel_type,
                     content=caption,
                     reply_msg_id=reply_to,
+                    client_msg_no=caption_client_msg_no,
+                    on_behalf_of=self.on_behalf_of,
                 )
-            return SendResult(success=True)
+            return _delivery_result(send_result)
         except Exception as e:
             logger.error("[%s] send_image failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
@@ -4001,16 +4278,9 @@ class OctoAdapter(BasePlatformAdapter):
                 metadata, allowed=frozenset(), media_name="file"
             )
             outbound_channel_id = self._outbound_channel_id(chat_id, channel_type)
-            if file_path.startswith(("http://", "https://")):
-                file_data, content_type, filename = await api.download_file(
-                    self._http_session, file_path
-                )
-            else:
-                import aiofiles
-                filename = file_name or os.path.basename(file_path)
-                content_type = api.infer_content_type(filename)
-                async with aiofiles.open(file_path, "rb") as f:
-                    file_data = await f.read()
+            file_data, content_type, filename = await self._load_outbound_media(
+                file_path
+            )
 
             if file_name:
                 filename = file_name
@@ -4019,20 +4289,26 @@ class OctoAdapter(BasePlatformAdapter):
                 self._http_session, self._api_url, self._bot_token,
                 filename, file_data, content_type,
             )
-            await api.send_media_message(
+            media_client_msg_no = str(uuid.uuid4())
+            send_result = await api.send_media_message(
                 self._http_session, self._api_url, self._bot_token,
                 channel_id=outbound_channel_id, channel_type=channel_type,
                 msg_type=OctoMessageType.File, url=uploaded_url,
                 name=filename, size=len(file_data),
                 reply_msg_id=reply_to,
+                client_msg_no=media_client_msg_no,
+                on_behalf_of=self.on_behalf_of,
             )
             if caption:
+                caption_client_msg_no = str(uuid.uuid4())
                 await api.send_message(
                     self._http_session, self._api_url, self._bot_token,
                     channel_id=outbound_channel_id, channel_type=channel_type,
                     content=caption, reply_msg_id=reply_to,
+                    client_msg_no=caption_client_msg_no,
+                    on_behalf_of=self.on_behalf_of,
                 )
-            return SendResult(success=True)
+            return _delivery_result(send_result)
         except Exception as e:
             logger.error("[%s] send_document failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
@@ -4054,33 +4330,32 @@ class OctoAdapter(BasePlatformAdapter):
                 metadata, allowed=frozenset({"duration"}), media_name="voice"
             )
             outbound_channel_id = self._outbound_channel_id(chat_id, channel_type)
-            if audio_path.startswith(("http://", "https://")):
-                file_data, content_type, filename = await api.download_file(
-                    self._http_session, audio_path
-                )
-            else:
-                import aiofiles
-                filename = os.path.basename(audio_path)
-                content_type = api.infer_content_type(filename)
-                async with aiofiles.open(audio_path, "rb") as f:
-                    file_data = await f.read()
+            file_data, content_type, filename = await self._load_outbound_media(
+                audio_path
+            )
             uploaded_url = await api.upload_and_get_url(
                 self._http_session, self._api_url, self._bot_token,
                 filename, file_data, content_type,
             )
-            await api.send_media_message(
+            media_client_msg_no = str(uuid.uuid4())
+            send_result = await api.send_media_message(
                 self._http_session, self._api_url, self._bot_token,
                 channel_id=outbound_channel_id, channel_type=channel_type,
                 msg_type=OctoMessageType.Voice, url=uploaded_url, name=filename,
                 duration=media_metadata.get("duration"), reply_msg_id=reply_to,
+                client_msg_no=media_client_msg_no,
+                on_behalf_of=self.on_behalf_of,
             )
             if caption:
+                caption_client_msg_no = str(uuid.uuid4())
                 await api.send_message(
                     self._http_session, self._api_url, self._bot_token,
                     channel_id=outbound_channel_id, channel_type=channel_type,
                     content=caption, reply_msg_id=reply_to,
+                    client_msg_no=caption_client_msg_no,
+                    on_behalf_of=self.on_behalf_of,
                 )
-            return SendResult(success=True)
+            return _delivery_result(send_result)
         except Exception as e:
             logger.error("[%s] send_voice failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
@@ -4104,21 +4379,15 @@ class OctoAdapter(BasePlatformAdapter):
                 media_name="video",
             )
             outbound_channel_id = self._outbound_channel_id(chat_id, channel_type)
-            if video_path.startswith(("http://", "https://")):
-                file_data, content_type, filename = await api.download_file(
-                    self._http_session, video_path
-                )
-            else:
-                import aiofiles
-                filename = os.path.basename(video_path)
-                content_type = api.infer_content_type(filename)
-                async with aiofiles.open(video_path, "rb") as f:
-                    file_data = await f.read()
+            file_data, content_type, filename = await self._load_outbound_media(
+                video_path
+            )
             uploaded_url = await api.upload_and_get_url(
                 self._http_session, self._api_url, self._bot_token,
                 filename, file_data, content_type,
             )
-            await api.send_media_message(
+            media_client_msg_no = str(uuid.uuid4())
+            send_result = await api.send_media_message(
                 self._http_session, self._api_url, self._bot_token,
                 channel_id=outbound_channel_id, channel_type=channel_type,
                 msg_type=OctoMessageType.Video, url=uploaded_url, name=filename,
@@ -4126,14 +4395,19 @@ class OctoAdapter(BasePlatformAdapter):
                 height=media_metadata.get("height"),
                 duration=media_metadata.get("duration"),
                 reply_msg_id=reply_to,
+                client_msg_no=media_client_msg_no,
+                on_behalf_of=self.on_behalf_of,
             )
             if caption:
+                caption_client_msg_no = str(uuid.uuid4())
                 await api.send_message(
                     self._http_session, self._api_url, self._bot_token,
                     channel_id=outbound_channel_id, channel_type=channel_type,
                     content=caption, reply_msg_id=reply_to,
+                    client_msg_no=caption_client_msg_no,
+                    on_behalf_of=self.on_behalf_of,
                 )
-            return SendResult(success=True)
+            return _delivery_result(send_result)
         except Exception as e:
             logger.error("[%s] send_video failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
@@ -4218,6 +4492,88 @@ def register(ctx) -> None:
             )
         except Exception as e:  # pragma: no cover — be defensive at import time
             logger.warning("[Octo] register_tool(octo_management) failed: %s", e)
+
+    if _bot_configured:
+        try:
+            from .card_tools import (
+                DISPLAY_CARD_TOOL_SCHEMA,
+                INTERACTIVE_CARD_TOOL_SCHEMA,
+                octo_send_display_card_handler,
+                octo_send_interactive_card_handler,
+            )
+        except Exception as e:  # pragma: no cover - defensive plugin loading
+            logger.warning("[Octo] card tool import failed: %s", e)
+        else:
+            card_tool_specs = (
+                (DISPLAY_CARD_TOOL_SCHEMA, octo_send_display_card_handler),
+                (INTERACTIVE_CARD_TOOL_SCHEMA, octo_send_interactive_card_handler),
+            )
+            for schema, handler in card_tool_specs:
+                name = schema["name"]
+                try:
+                    ctx.register_tool(
+                        name=name,
+                        toolset="octo",
+                        schema=schema,
+                        handler=handler,
+                        check_fn=check_octo_requirements,
+                        requires_env=list(_REQUIRED_ENV),
+                        is_async=True,
+                        description=schema.get("description", ""),
+                    )
+                except Exception as e:  # pragma: no cover - isolate registrations
+                    logger.warning("[Octo] register_tool(%s) failed: %s", name, e)
+
+    if _bot_configured:
+        try:
+            from .message_tools import MESSAGE_TOOL_HANDLERS, MESSAGE_TOOL_SCHEMAS
+        except Exception as e:  # pragma: no cover - defensive plugin loading
+            logger.warning("[Octo] message tool import failed: %s", e)
+        else:
+            for schema in MESSAGE_TOOL_SCHEMAS:
+                name = schema["name"]
+                try:
+                    ctx.register_tool(
+                        name=name,
+                        toolset="octo",
+                        schema=schema,
+                        handler=MESSAGE_TOOL_HANDLERS[name],
+                        check_fn=check_octo_requirements,
+                        requires_env=list(_REQUIRED_ENV),
+                        is_async=True,
+                        description=schema.get("description", ""),
+                    )
+                except Exception as e:  # pragma: no cover - isolate registrations
+                    logger.warning("[Octo] register_tool(%s) failed: %s", name, e)
+
+    if _bot_configured:
+        try:
+            from .card_progress import (
+                on_post_llm_call,
+                on_post_tool_call,
+                on_pre_llm_call,
+                on_pre_tool_call,
+                on_session_end,
+            )
+        except Exception as e:  # pragma: no cover - defensive plugin loading
+            logger.warning("[Octo] progress hook import failed: %s", e)
+        else:
+            progress_hooks = (
+                ("pre_llm_call", on_pre_llm_call),
+                ("post_llm_call", on_post_llm_call),
+                ("pre_tool_call", on_pre_tool_call),
+                ("post_tool_call", on_post_tool_call),
+                ("on_session_end", on_session_end),
+            )
+            for hook_name, callback in progress_hooks:
+                try:
+                    ctx.register_hook(hook_name, callback)
+                except Exception as e:  # pragma: no cover - isolate registrations
+                    logger.warning(
+                        "[Octo] register_hook(%s) failed: %s",
+                        hook_name,
+                        e,
+                    )
 
     # Register the bundled Octo Bot API skill so the LLM can load it on
     # demand via skill_view("octo:octo-bot-api"). Not auto-injected into

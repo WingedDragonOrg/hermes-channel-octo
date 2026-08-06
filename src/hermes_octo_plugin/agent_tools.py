@@ -24,9 +24,8 @@ Permissions:
   - All operations that hit a specific channel honour
     :meth:`OctoAdapter.check_read_permission` semantics (replicated locally
     so we can use the per-call session).
-  - ``requester_uid`` is only a caller claim. It must match the trusted
-    ``HERMES_SESSION_USER_ID`` propagated by Hermes for an Octo turn before it
-    participates in any permission decision.
+  - Requester identity comes only from Hermes' trusted task-local Octo session;
+    the model-facing schema never asks the model to repeat an authenticated UID.
   - Mutating operations (create-group / add-members / group-md-update /
     voice-context-update) require that trusted requester to equal the bot owner.
 """
@@ -36,6 +35,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import uuid
 from datetime import UTC
 from typing import Any
 
@@ -130,10 +130,7 @@ TOOL_SCHEMA = {
         "an action parameter — pick the action and supply the required "
         "fields. Cross-channel read enforces permissions: only the bot "
         "owner may read another user's DM; group/thread reads require "
-        "the requester to be a member. Pass `requester_uid` (the uid of "
-        "the human currently chatting with the bot) for ALL read / "
-        "search / mutation calls. It is treated as a claim and must match "
-        "Hermes' trusted Octo session identity before authorization."
+        "the trusted current-session requester to be a member."
     ),
     "parameters": {
         "type": "object",
@@ -233,16 +230,8 @@ TOOL_SCHEMA = {
                     "leave-thread, thread-md-read, thread-md-update."
                 ),
             },
-            "requester_uid": {
-                "type": "string",
-                "description": (
-                    "Claimed uid of the human who triggered this call. It "
-                    "must match the trusted sender identity in the current "
-                    "Hermes Octo session. Required for every action."
-                ),
-            },
         },
-        "required": ["action", "requester_uid"],
+        "required": ["action"],
     },
 }
 
@@ -434,29 +423,11 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
     if not api_url or not bot_token:
         return _err("Octo adapter is not configured (missing api_url / bot_token)")
 
-    claimed_requester_uid: str | None = args.get("requester_uid")
-
-    # The tool schema carries requester identity for every action.  Do this
-    # before opening a session so an unauthenticated call cannot even issue a
-    # read-only request, much less a mutation.
-    if not claimed_requester_uid:
-        return _err(f"action '{action}' requires requester_uid")
-
-    trusted_requester_uid = _trusted_requester_uid()
-    if not trusted_requester_uid:
+    requester_uid = _trusted_requester_uid()
+    if not requester_uid:
         return _err(
             f"action '{action}' requires a trusted Octo session requester"
         )
-    if claimed_requester_uid != trusted_requester_uid:
-        _audit(
-            action=action,
-            requester=trusted_requester_uid,
-            target="<requester-claim>",
-            result="denied",
-            reason="requester_uid mismatch",
-        )
-        return _err("requester_uid does not match trusted Octo session")
-    requester_uid = trusted_requester_uid
 
     # These values become URL path segments in the API layer. Reject malformed
     # input before opening a session or performing a membership lookup; API
@@ -624,6 +595,7 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
                 # Joining/leaving a thread mutates bot membership and remains
                 # an explicit owner-only action. Sending must not smuggle that
                 # mutation past the permission boundary.
+                client_msg_no = str(uuid.uuid4())
                 send_result = await api.send_message(
                     session, api_url, bot_token,
                     channel_id=channel_id,
@@ -632,6 +604,8 @@ async def octo_management_handler(args: dict, **_kwargs) -> str:  # noqa: PLR091
                     mention_uids=mention_uids,
                     mention_all=mention_all,
                     reply_msg_id=args.get("reply_to_message_id") or None,
+                    client_msg_no=client_msg_no,
+                    on_behalf_of=adapter.on_behalf_of,
                 )
                 _audit(
                     action="send-message", requester=requester_uid,

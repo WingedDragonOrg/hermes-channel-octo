@@ -316,9 +316,11 @@ async def test_media_api_preserves_the_server_defined_fields_and_reply(
     kwargs: dict[str, int],
     expected_payload: dict[str, object],
 ):
-    post_json = AsyncMock()
+    post_json = AsyncMock(
+        return_value={"message_id": "media-1", "message_seq": 7}
+    )
     with patch.object(api, "post_json", post_json):
-        await api.send_media_message(
+        result = await api.send_media_message(
             MagicMock(),
             "https://api.example.invalid",
             "test-token",
@@ -327,13 +329,20 @@ async def test_media_api_preserves_the_server_defined_fields_and_reply(
             msg_type,
             "https://cdn.example/a.gif",
             reply_msg_id="parent-message",
+            client_msg_no="media-dedup-1",
+            on_behalf_of="grantor-1",
             **kwargs,
         )
+    assert result.message_id == "media-1"
+    assert result.message_seq == 7
+    assert result.client_msg_no == "media-dedup-1"
 
     assert post_json.await_args.args[3] == "/v1/bot/sendMessage"
     assert post_json.await_args.args[4] == {
         "channel_id": "user-1",
         "channel_type": ChannelType.DM,
+        "client_msg_no": "media-dedup-1",
+        "on_behalf_of": "grantor-1",
         "payload": {
             **expected_payload,
             "reply": {"message_id": "parent-message"},
@@ -433,3 +442,120 @@ async def test_outbound_image_rejects_unsupported_media_metadata_before_io():
     assert "duration" in (result.error or "")
     download.assert_not_awaited()
     send_media.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method_name",
+    ["send_document", "send_voice", "send_video"],
+)
+@pytest.mark.parametrize("as_file_url", [False, True])
+async def test_native_media_accepts_local_paths(
+    tmp_path,
+    method_name: str,
+    as_file_url: bool,
+):
+    source = tmp_path / "media.bin"
+    source.write_bytes(b"local media")
+    source_value = source.as_uri() if as_file_url else str(source)
+    adapter = make_bare_adapter()
+    adapter._http_session = MagicMock()
+    adapter._api_url = "https://api.example.invalid"
+    adapter._bot_token = "test-token"
+    upload = AsyncMock(return_value="https://cdn.example/uploaded")
+    send = AsyncMock()
+
+    with (
+        patch.object(api, "upload_and_get_url", upload),
+        patch.object(api, "send_media_message", send),
+    ):
+        result = await getattr(adapter, method_name)("group-1", source_value)
+
+    assert result.success is True
+    assert upload.await_args.args[3] == "media.bin"
+    assert upload.await_args.args[4] == b"local media"
+    send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_native_media_accepts_data_urls() -> None:
+    adapter = make_bare_adapter()
+    adapter._http_session = MagicMock()
+    adapter._api_url = "https://api.example.invalid"
+    adapter._bot_token = "test-token"
+    upload = AsyncMock(return_value="https://cdn.example/uploaded")
+    send = AsyncMock()
+
+    with (
+        patch.object(api, "upload_and_get_url", upload),
+        patch.object(api, "send_media_message", send),
+    ):
+        result = await adapter.send_document(
+            "group-1",
+            "data:text/plain;base64,bG9jYWwgbWVkaWE=",
+        )
+
+    assert result.success is True
+    assert upload.await_args.args[3:6] == (
+        "file.txt",
+        b"local media",
+        "text/plain",
+    )
+    send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method_name",
+    ["send_document", "send_voice", "send_video"],
+)
+async def test_native_remote_media_uses_the_server_upload_limit(method_name: str):
+    adapter = make_bare_adapter()
+    adapter._http_session = MagicMock()
+    adapter._api_url = "https://api.example.invalid"
+    adapter._bot_token = "test-token"
+    download = AsyncMock(
+        return_value=(b"media", "application/octet-stream", "source.bin")
+    )
+
+    with (
+        patch.object(api, "download_file", download),
+        patch.object(
+            api,
+            "upload_and_get_url",
+            AsyncMock(return_value="https://cdn.example/uploaded"),
+        ),
+        patch.object(api, "send_media_message", AsyncMock()),
+    ):
+        result = await getattr(adapter, method_name)(
+            "group-1",
+            "https://source.example/media.bin",
+        )
+
+    assert result.success is True
+    assert download.await_args.kwargs["max_size"] == api.MAX_OUTBOUND_MEDIA_BYTES
+    assert download.await_args.kwargs["enforce_host_safety"] is False
+
+@pytest.mark.asyncio
+async def test_native_image_download_failure_does_not_fall_back_to_remote_url():
+    adapter = make_bare_adapter()
+    adapter._http_session = MagicMock()
+    adapter._api_url = "https://api.example.invalid"
+    adapter._bot_token = "test-token"
+    send = AsyncMock()
+
+    with (
+        patch.object(
+            api,
+            "download_file",
+            AsyncMock(side_effect=RuntimeError("download rejected")),
+        ),
+        patch.object(api, "send_media_message", send),
+    ):
+        result = await adapter.send_image(
+            "group-1",
+            "https://source.example/image.png",
+        )
+
+    assert result.success is False
+    send.assert_not_awaited()

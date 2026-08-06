@@ -330,6 +330,38 @@ async def test_cancellation_while_draining_reconnect_still_finishes_disconnect()
 
 
 @pytest.mark.asyncio
+async def test_disconnect_stops_card_event_poller_before_stream_drain():
+    a = _make_adapter()
+    a._reconnect_task = None
+    a._heartbeat_task = None
+    a._http_heartbeat_task = None
+    a._recv_task = None
+    a._cache_cleanup_task = None
+    a._prefetch_task = None
+    a._ws = None
+    a._mark_disconnected = MagicMock()
+    a._http_session = None
+    a._active_streams = {"group-1": {}}
+    poller = MagicMock()
+    a._event_poller = poller
+    a._event_task = None
+    entered_flush = asyncio.Event()
+    release_flush = asyncio.Event()
+
+    async def blocking_flush(_chat_id):
+        entered_flush.set()
+        await release_flush.wait()
+
+    a._close_active_stream = blocking_flush  # type: ignore[method-assign]
+    task = asyncio.create_task(a.disconnect())
+    await entered_flush.wait()
+
+    assert poller.stop.called
+    release_flush.set()
+    await task
+
+
+@pytest.mark.asyncio
 async def test_disconnect_cancels_prefetch_before_closing_session():
     a = _make_adapter()
     a._reconnect_task = None
@@ -473,6 +505,31 @@ async def test_reconnect_reschedules_on_connect_failure():
             await t
 
     assert calls >= 2, "failure should trigger a retry"
+
+
+@pytest.mark.asyncio
+async def test_do_connect_prefers_configured_websocket_url():
+    adapter = _make_adapter()
+    adapter._ws_url = "wss://override.example/socket"
+    registration = MagicMock(
+        robot_id="bot",
+        owner_uid="owner",
+        im_token="token",
+        ws_url="wss://server.example/socket",
+    )
+    connect = AsyncMock(side_effect=RuntimeError("stop after URL selection"))
+
+    with (
+        patch(
+            "hermes_octo_plugin.adapter.api.register_bot",
+            AsyncMock(return_value=registration),
+        ),
+        patch("hermes_octo_plugin.adapter.websockets.connect", connect),
+    ):
+        with pytest.raises(RuntimeError, match="URL selection"):
+            await adapter._do_connect()
+
+    assert connect.await_args.args[0] == "wss://override.example/socket"
 
 
 # ─── Token refresh cooldown ──────────────────────────────────────────────────

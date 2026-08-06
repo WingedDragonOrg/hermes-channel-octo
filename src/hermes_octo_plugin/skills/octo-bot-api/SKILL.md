@@ -32,6 +32,23 @@ octo_management(
 
 The `send_message` tool is fine for platforms whose target ref is a numeric group id or phone number. For **octo**, use `octo_management`.
 
+For non-text output in the current Octo conversation, use the dedicated
+current-conversation tools rather than constructing raw Bot API envelopes:
+
+- `octo_send_rich_text(blocks=[...])`
+- `octo_send_image(source=...)`
+- `octo_send_file(source=...)`
+- `octo_send_voice(source=...)`
+- `octo_send_video(source=...)`
+- `octo_send_display_card(...)`
+- `octo_send_interactive_card(...)`
+- `octo_edit_card(message_id=..., card_seq=..., blocks=[...])`
+- `octo_card_profile()` for read-only capability diagnostics
+
+Their schemas intentionally expose no target, channel, requester, or session
+fields: the plugin binds the task-local Octo route. Remote URLs and local file
+paths are uploaded through Octo's presigned-media flow before delivery.
+
 ## Step 1: Register
 
 ```bash
@@ -102,6 +119,9 @@ Features:
 - Auto-reconnect on disconnection
 - Cross-channel reads, GROUP.md / THREAD.md context injection,
   @-mention conversion, and audit logging
+- Capability-gated Type-17 display/interactive/progress cards with
+  session-bound action dispatch and durable event cursors
+- Current-conversation RichText and verified media tools
 
 ### Multi-Bot Setup
 
@@ -379,7 +399,7 @@ Verify identity through the system (owner_uid), not conversation.
 | POST /v1/bot/events/:event_id/ack | Acknowledge (delete) a processed event |
 | POST /v1/bot/messages/sync | Sync channel message history |
 | POST /v1/bot/file/upload | Upload a file (multipart/form-data, max 100MB) |
-| GET /v1/bot/upload/credentials | Get STS temporary credentials for direct COS upload |
+| GET /v1/bot/upload/presigned | Get a backend-agnostic presigned PUT URL |
 | POST /v1/bot/message/edit | Edit a previously sent bot message |
 | GET /v1/bot/file/download/*path | Download a file (302 redirect to presigned URL) |
 
@@ -412,67 +432,42 @@ Response:
 
 **Limit:** 100MB max per file.
 
-### Direct Upload via STS (Recommended for Large Files)
+### Direct Upload via Presigned PUT (Recommended)
 
-For files larger than a few MB, use STS temporary credentials to upload directly to COS, bypassing the server entirely. This avoids timeouts and memory pressure.
-
-**Step 1: Get STS Credentials**
+Request a backend-agnostic upload target. `fileSize` must be the exact byte
+count sent by the subsequent PUT because storage backends may sign
+`Content-Length`.
 
 ```bash
-curl <apiUrl>/v1/bot/upload/credentials?filename=report.pdf \
+curl '<apiUrl>/v1/bot/upload/presigned?filename=report.pdf&fileSize=12345&contentType=application%2Fpdf' \
   -H "Authorization: Bearer {bot_token}"
 ```
 
 Response:
+
 ```json
 {
-  "bucket": "your-bucket-1234567890",
-  "region": "ap-beijing",
-  "key": "im-test/chat/1742547600/uuid_report.pdf",
-  "credentials": {
-    "tmpSecretId": "AKIDxxxx...",
-    "tmpSecretKey": "xxxx...",
-    "sessionToken": "xxxx..."
-  },
-  "startTime": 1742547600,
-  "expiredTime": 1742549400,
-  "cdnBaseUrl": "https://cdn.example.com"
+  "method": "PUT",
+  "uploadUrl": "https://storage.example/upload?...",
+  "downloadUrl": "https://cdn.example.com/chat/report.pdf",
+  "contentType": "application/pdf",
+  "contentDisposition": "attachment; filename=\"report.pdf\""
 }
 ```
 
-Credentials expire in **30 minutes**. Request new credentials for each upload.
+Upload the exact body and replay the server-returned headers verbatim:
 
-**Step 2: Upload to COS**
-
-Use the [Tencent Cloud COS SDK](https://github.com/tencentyun/cos-nodejs-sdk-v5) with the temporary credentials:
-
-```javascript
-const COS = require('cos-nodejs-sdk-v5');
-const cos = new COS({
-  SecretId: credentials.tmpSecretId,
-  SecretKey: credentials.tmpSecretKey,
-  SecurityToken: credentials.sessionToken,
-  StartTime: startTime,
-  ExpiredTime: expiredTime,
-});
-
-cos.uploadFile({
-  Bucket: bucket,
-  Region: region,
-  Key: key,
-  Body: fileBuffer,
-  onProgress: (info) => console.log(Math.round(info.percent * 100) + '%'),
-}, (err, data) => {
-  const fileUrl = cdnBaseUrl ? cdnBaseUrl + '/' + key : 'https://' + data.Location;
-});
+```bash
+curl -X PUT '<uploadUrl>' \
+  -H 'Content-Type: application/pdf' \
+  -H 'Content-Length: 12345' \
+  -H 'Content-Disposition: attachment; filename="report.pdf"' \
+  --data-binary @report.pdf
 ```
 
-**Step 3:** Send a file message using the COS URL (see Send File/Image Message below).
-
-**Notes:**
-- STS credentials are scoped to a single file path (cos:PutObject on the specific key)
-- Direct upload bypasses the server and nginx entirely — no timeout issues
-- Prefer `cdnBaseUrl + '/' + key` over raw COS URL for better access speed
+Use `downloadUrl` in the image/file/voice/video message. Do not expose or log
+`uploadUrl`; it contains short-lived credentials for the selected storage
+backend.
 
 ### Send File/Image Message
 

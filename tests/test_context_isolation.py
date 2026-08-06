@@ -6,6 +6,7 @@ import asyncio
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 from types import SimpleNamespace
 import time
+from uuid import UUID
 
 import pytest
 
@@ -150,6 +151,7 @@ async def test_space_qualified_dm_sessions_stay_isolated_but_reply_to_bare_uid()
     adapter._http_session = MagicMock()
     adapter._api_url = "https://api.example.invalid"
     adapter._bot_token = "test-token"
+    adapter._on_behalf_of = "grantor-1"
     with patch.object(
         api,
         "send_message",
@@ -162,6 +164,9 @@ async def test_space_qualified_dm_sessions_stay_isolated_but_reply_to_bare_uid()
     assert result.success is True
     assert send_message.await_args.kwargs["channel_id"] == "user-1"
     assert send_message.await_args.kwargs["channel_type"] == ChannelType.DM
+    assert send_message.await_args.kwargs["on_behalf_of"] == "grantor-1"
+    client_msg_no = send_message.await_args.kwargs["client_msg_no"]
+    assert str(UUID(client_msg_no)) == client_msg_no
 
 
 @pytest.mark.asyncio
