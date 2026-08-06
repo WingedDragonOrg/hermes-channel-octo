@@ -124,11 +124,49 @@ class TestResolveContent:
         result = adapter._resolve_content(payload)
         assert "[位置信息]" in result
 
+    def test_location_message_preserves_server_coordinates_and_address(self):
+        payload = MessagePayload(
+            type=MessageType.Location,
+            extra={
+                "latitude": 31.2304,
+                "longitude": 121.4737,
+                "address": "People's Square",
+            },
+        )
+        adapter = make_bare_adapter()
+        result = adapter._resolve_content(payload)
+        assert "People's Square" in result
+        assert "31.2304" in result
+        assert "121.4737" in result
+
     def test_card_message(self):
         payload = MessagePayload(type=MessageType.Card, name="Alice")
         adapter = make_bare_adapter()
         result = adapter._resolve_content(payload)
         assert "[名片: Alice]" in result
+
+    def test_card_message_preserves_server_contact_uid(self):
+        payload = MessagePayload(
+            type=MessageType.Card,
+            name="Alice",
+            extra={"uid": "u-alice"},
+        )
+        adapter = make_bare_adapter()
+        assert "u-alice" in adapter._resolve_content(payload)
+
+    def test_interactive_card_prefers_server_safe_plain_text(self):
+        payload = MessagePayload(
+            type=MessageType.InteractiveCard,
+            plain="Visible card summary",
+            extra={"card": {"hidden_reasoning": "must not render"}},
+        )
+        adapter = make_bare_adapter()
+        assert adapter._resolve_content(payload) == "Visible card summary"
+
+    def test_unknown_message_type_keeps_a_readable_raw_type_fallback(self):
+        payload = MessagePayload(type=999)
+        adapter = make_bare_adapter()
+        assert adapter._resolve_content(payload) == "[未知消息类型: 999]"
 
     def test_empty_text(self):
         payload = MessagePayload(type=MessageType.Text, content="")

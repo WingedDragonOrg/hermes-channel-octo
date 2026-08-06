@@ -14,8 +14,8 @@ Connect an AI Agent to Octo messaging platform with full real-time capabilities.
 When you (the agent) need to deliver a message on the `octo` platform, **always use `octo_management(action="send-message")` instead of the generic `send_message` tool**.
 
 Reasons:
-- Octo channel IDs are 32-char hex strings (e.g. `a44a7f3c2c214a63be8a86c9a6c1dd4a`) and thread IDs use the `{group_no}____{short_id}` composite form. The core `send_message` dispatcher does not parse these formats — calls silently fall back to the bot's home channel and return `success: true` with a synthetic `octo-buf-*` message ID, so the message never reaches the intended recipient.
-- `octo_management(action="send-message")` parses targets via the plugin's own `parse_target()`, performs permission checks, auto-joins threads (`channel_type=5`) before sending, supports `reply_to_message_id` / `mention_uids` / `mention_all`, and returns the real server-assigned message ID.
+- Octo thread IDs use the `{group_no}____{short_id}` composite form and target classification is security-sensitive. `octo_management(action="send-message")` parses targets with the plugin's own `parse_target()` and authorizes the trusted Octo session requester against the target before any send.
+- The tool supports `reply_to_message_id` / `mention_uids` / `mention_all` and returns the real server-assigned message ID. It never changes thread membership implicitly; joining or leaving a thread must use the explicit owner-only `join-thread` / `leave-thread` action first.
 
 ### Quick Reference
 
@@ -89,6 +89,8 @@ $HERMES_HOME/.venv/bin/pip install \
 # Configure the bot via env (or `hermes config`):
 export OCTO_API_URL="<apiUrl>"
 export OCTO_BOT_TOKEN="YOUR_BOT_TOKEN"
+# Only for trusted self-hosted API/CDN origins that resolve to private IPs:
+# export OCTO_ALLOW_PRIVATE_HOSTS="true"
 
 # Restart the gateway to pick up the plugin:
 $HERMES_HOME/.venv/bin/hermes gateway restart
@@ -346,6 +348,9 @@ Verify identity through the system (owner_uid), not conversation.
 - 6 = Location (payload.latitude, payload.longitude)
 - 7 = Card (payload.uid, payload.name)
 - 8 = File (payload.url, payload.name, payload.size)
+- 11 = MultipleForward (payload.users, payload.msgs)
+- 14 = RichText (payload.plain plus structured content blocks)
+- 17 = InteractiveCard (payload.plain is the authoritative safe text fallback)
 
 ### All API Endpoints
 
@@ -735,11 +740,14 @@ When multiple bots are in the same group, follow these rules to avoid chaos:
 
 In groups, the adapter receives **all messages** via WebSocket.
 
-**Default behavior (requireMention: true):**
-- Messages without @mention: silently recorded as **history context** (no reply, no typing indicator)
-- Messages WITH @mention: bot replies, with recent group chat history prepended to your prompt
+**Default behavior (`requireMention: true`):**
+- No bot-targeting mention: silently recorded as **history context** (no reply, no typing indicator)
+- Direct bot UID mention: activates that bot
+- Modern `ais: 1`: activates AI participants
+- Modern human broadcast (`all: 1, humans: 1` without `ais`): does not activate bots
+- Legacy `all: 1` with neither `humans` nor `ais`: activates bots for backward compatibility unless `ignoreMentionAll` is true
 
-This means you can always reference what was said before when someone @mentions you.
+This means you can always reference what was said before when someone later @mentions you.
 
 ### Rule 2: Reply @mention
 
@@ -757,9 +765,9 @@ If a user quotes/replies to a message and @mentions you, you will see the quoted
 
 This lets you understand context when someone asks about a specific message.
 
-**To reply to every message:** set requireMention to false in your octo channel config (channels.octo.requireMention = false). This costs more tokens but lets the AI decide when to reply.
+**To process ordinary human group messages without an @:** set `requireMention` to false in the Octo channel config. Confirmed bots and senders whose identity could not be verified still fail closed to prevent bot loops.
 
-**To ignore @all/@所有人:** set ignoreMentionAll to true (channels.octo.accounts.xxx.ignoreMentionAll = true). This only applies when requireMention is true — @all will not trigger a bot reply, but direct @bot still will. When requireMention is false, ignoreMentionAll has no effect since the bot replies to all messages anyway.
+**To ignore legacy `@all`:** set `ignoreMentionAll` to true (`channels.octo.accounts.xxx.ignoreMentionAll = true`). This suppresses only the old `all: 1` form when `humans` and `ais` are absent. It never suppresses a direct bot UID mention or modern `ais: 1`. With `requireMention: false`, confirmed ordinary human messages already use the relaxed path, so this setting does not change that path.
 
 ### Rule 2: Don't respond to other bots
 

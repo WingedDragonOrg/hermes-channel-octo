@@ -105,6 +105,34 @@ class TestMultipleForwardExpansion:
         assert "[文件: report.pdf]" in out
         assert "doc.pdf" in out
 
+    @pytest.mark.parametrize(
+        ("inner_payload", "expected"),
+        [
+            (
+                {
+                    "type": int(MessageType.Location),
+                    "latitude": 31.2304,
+                    "longitude": 121.4737,
+                    "address": "People's Square",
+                },
+                ("People's Square", "31.2304", "121.4737"),
+            ),
+            (
+                {
+                    "type": int(MessageType.Card),
+                    "uid": "u-alice",
+                    "name": "Alice",
+                },
+                ("Alice", "u-alice"),
+            ),
+        ],
+    )
+    def test_inner_metadata_messages_preserve_server_fields(self, inner_payload, expected):
+        a = _make_adapter()
+        out = a._resolve_inner_message_text({"payload": inner_payload})
+        for value in expected:
+            assert value in out
+
     def test_nested_forward_recurses(self):
         a = _make_adapter()
         inner_forward = {

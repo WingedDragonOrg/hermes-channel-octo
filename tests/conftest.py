@@ -2,6 +2,9 @@
 Shared pytest configuration and fixtures.
 """
 
+import asyncio
+import weakref
+
 import pytest
 
 
@@ -46,18 +49,25 @@ def make_bare_adapter():
     a._uid_to_name = {}
     a._base_uid_to_name = {}
     a._member_map = {}
+    a._group_member_rosters = {}
+    a._group_robot_map = {}
     a._name_cache = LRUCache(max_size=NAME_CACHE_MAX_SIZE)
     a._user_group_index = {}
     a._group_names = {}
     a._known_group_ids = set()
     # Per-channel caches
     a._chat_kind = {}
+    a._space_dm_targets = {}
     a._group_md_cache = {}
     a._group_md_checked = set()
+    a._group_scope_generations = {}
     a._group_histories = {}
     a._group_cache_timestamps = {}
     a._cache_activity = {}
     a._active_streams = {}
+    a._stream_locks = weakref.WeakValueDictionary()
+    a._stream_creation_tasks = set()
+    a._disconnecting = False
     # Connection / lifecycle state
     a._ws = None
     a._http_session = None
@@ -68,8 +78,17 @@ def make_bare_adapter():
     a._reconnect_in_progress = False
     a._last_token_refresh = 0.0
     a._ping_retry_count = 0
+    a._http_heartbeat_disabled = False
+    a._http_heartbeat_task = None
+    a._heartbeat_task = None
+    a._recv_task = None
+    a._cache_cleanup_task = None
+    a._reconnect_task = None
+    a._prefetch_task = None
+    a._lifecycle_lock = asyncio.Lock()
     # Identity / config (callers override as needed)
     a._api_url = ""
+    a._cdn_url = ""
     a._bot_token = ""
     a._robot_id = ""
     a._owner_uid = ""

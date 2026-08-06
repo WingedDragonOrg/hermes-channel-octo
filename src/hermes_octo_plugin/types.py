@@ -34,6 +34,7 @@ class MessageType(IntEnum):
     # common/richtext.go — payload.content carries an ordered array of
     # {type:text|image} blocks. Field names must match octo-lib.
     RichText = 14
+    InteractiveCard = 17
 
 
 # RichText(=14) block type constants (aligned with octo-lib
@@ -102,6 +103,17 @@ class MentionPayload:
     uids: list[str] | None = None
     entities: list[MentionEntity] | None = None
     all: bool | None = None  # True or 1 = @all
+    humans: bool | None = None
+    ais: bool | None = None
+
+
+def _coerce_wire_bool(value: Any) -> bool | None:
+    """Normalize the protocol's boolean/0/1 flags without truthiness traps."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    return None
 
 
 @dataclass
@@ -120,7 +132,7 @@ class MessagePayload:
     The `type` field determines which other fields are populated.
     Additional unknown fields are captured in `extra`.
     """
-    type: MessageType = MessageType.Text
+    type: MessageType | int = MessageType.Text
     content: str | None = None
     url: str | None = None
     name: str | None = None
@@ -157,7 +169,9 @@ class MessagePayload:
             mention = MentionPayload(
                 uids=m.get("uids"),
                 entities=entities,
-                all=m.get("all"),
+                all=_coerce_wire_bool(m.get("all")),
+                humans=_coerce_wire_bool(m.get("humans")),
+                ais=_coerce_wire_bool(m.get("ais")),
             )
 
         reply = None
@@ -169,13 +183,13 @@ class MessagePayload:
                 from_name=r.get("from_name"),
             )
 
-        # Tolerate unknown message types from the server (e.g. system
-        # notifications). Fall back to Text so the adapter doesn't crash.
+        # Preserve unknown numeric message types.  Coercing them to Text
+        # hides protocol evolution and can misrepresent a non-text payload.
         raw_type = data.get("type", 1)
         try:
             msg_type = MessageType(raw_type)
-        except ValueError:
-            msg_type = MessageType.Text
+        except (TypeError, ValueError):
+            msg_type = raw_type if isinstance(raw_type, int) and not isinstance(raw_type, bool) else -1
 
         # RichText(=14): wire `content` is a list of blocks, and `plain`
         # is a top-level string. Legacy string-typed `content` on RichText
@@ -236,8 +250,9 @@ class BotRegisterResp:
 @dataclass
 class SendMessageResult:
     """Response from /v1/bot/sendMessage API."""
-    message_id: int
-    message_seq: int
+    message_id: str | None = None
+    message_seq: int | None = None
+    client_msg_no: str | None = None
 
 
 @dataclass
@@ -246,7 +261,7 @@ class GroupMember:
     uid: str
     name: str
     role: str | None = None  # admin/member
-    robot: bool | None = None
+    robot: bool | int | None = None
 
 
 @dataclass

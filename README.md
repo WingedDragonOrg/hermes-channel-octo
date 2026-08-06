@@ -14,12 +14,13 @@ streaming responses.
 
 | hermes-agent | hermes-channel-octo |
 |---|---|
-| `>=0.14,<0.16` | `0.1.x` |
+| `>=0.14,<0.21` | `0.1.x` |
 
 ## Install
 
-The plugin supports two install paths. Both have been end-to-end
-verified against `hermes-agent==0.15.2`.
+The plugin supports two install paths. The current compatibility gate is
+verified against `hermes-agent==0.20.0`; the lower bound remains `0.14` for
+existing installations.
 
 All commands below assume `HERMES_HOME` points at the hermes install you
 want to wire the plugin into, and that you invoke the matching `hermes`
@@ -58,7 +59,7 @@ $HERMES plugins enable octo
 
 # bundled-plugin protocol does NOT install pyproject deps — install manually:
 $PIP install 'websockets>=15.0,<16' 'aiohttp>=3.13,<4' \
-             'cryptography>=46.0,<47' 'python-socks>=2.8,<3'
+             'cryptography>=46.0,<49' 'python-socks>=2.8,<3'
 ```
 
 `hermes plugins install` clones into `$HERMES_HOME/plugins/octo/` (the
@@ -77,6 +78,7 @@ Set the following in `$HERMES_HOME/.env` (or via `hermes config`):
 | `OCTO_API_URL` | yes | Octo bot API base URL (e.g. `https://api.botgate.cn`) |
 | `OCTO_BOT_TOKEN` | yes | Octo bot authentication token |
 | `OCTO_CDN_URL` | no | CDN prefix for media acceleration |
+| `OCTO_ALLOW_PRIVATE_HOSTS` | no | Set to `true` only for trusted self-hosted API/CDN origins that resolve to private IPs; metadata endpoints remain blocked |
 | `OCTO_ALLOWED_USERS` | no | Comma-separated user IDs allowed to talk to the bot |
 | `OCTO_ALLOW_ALL_USERS` | no | Allow any user to trigger the bot (dev only) |
 | `OCTO_HOME_CHANNEL` | no | Default group/chat ID for cron / notification delivery |
