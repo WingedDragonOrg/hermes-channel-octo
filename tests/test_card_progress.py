@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from hermes_octo_plugin import card_progress, cards
+from hermes_octo_plugin import card_progress, cards, types
 from hermes_octo_plugin.card_tools import TrustedOctoRoute
 from hermes_octo_plugin.types import CardProfileManifest, ChannelType, SendMessageResult
 
@@ -88,7 +88,9 @@ async def test_progress_lifecycle_sends_then_edits_transient_and_final() -> None
     send = AsyncMock(return_value=SendMessageResult(message_id="progress-1"))
     edit = AsyncMock(return_value={})
     with (
-        patch.object(card_progress.api, "get_card_profile", AsyncMock(return_value=_MANIFEST)),
+        patch.object(
+            card_progress.api, "get_card_profile", AsyncMock(return_value=_MANIFEST)
+        ),
         patch.object(card_progress.api, "send_card_message", send),
         patch.object(card_progress.api, "edit_card_message", edit),
     ):
@@ -135,15 +137,13 @@ async def test_progress_lifecycle_sends_then_edits_transient_and_final() -> None
         await adapter.run_next()
 
     assert send.await_count == 1
-    assert edit.await_count == 2
-    transient = edit.await_args_list[0].kwargs
-    final = edit.await_args_list[1].kwargs
-    assert transient["card_seq"] == 1
-    assert transient["transient"] is True
-    assert "read (/tmp/a.py): complete" in transient["plain"]
-    assert "bash (pytest): failed" in transient["plain"]
-    assert "AKIA1234567890ABCDEF" not in transient["plain"]
-    assert final["card_seq"] == 2
+    assert edit.await_count == 1
+    sent = send.await_args.kwargs
+    final = edit.await_args.kwargs
+    assert "read (/tmp/a.py): complete" in sent["plain"]
+    assert "bash (pytest): failed" in sent["plain"]
+    assert "AKIA1234567890ABCDEF" not in sent["plain"]
+    assert final["card_seq"] == 1
     assert final["transient"] is False
     assert final["plain"].startswith("Completed")
     assert controller.state_count == 0
@@ -164,9 +164,50 @@ def test_progress_is_disabled_for_on_behalf_of_delivery() -> None:
     assert controller.state_count == 0
     assert adapter.pending == []
 
+@pytest.mark.asyncio
+async def test_progress_stays_silent_for_pure_model_turn_and_card_authoring_tools() -> None:
+    controller = card_progress.CardProgressController()
+    adapter = _Adapter()
+    send = AsyncMock(return_value=SendMessageResult(message_id="unexpected"))
+    with (
+        patch.object(
+            card_progress.api, "get_card_profile", AsyncMock(return_value=_MANIFEST)
+        ),
+        patch.object(card_progress.api, "send_card_message", send),
+    ):
+        controller.begin(
+            adapter=adapter,
+            route=_ROUTE,
+            session_id="session-1",
+            turn_id="turn-1",
+        )
+        controller.model_started(
+            session_id="session-1", turn_id="turn-1", model_call_id="model-1"
+        )
+        controller.model_finished(
+            session_id="session-1", turn_id="turn-1", model_call_id="model-1"
+        )
+        controller.tool_started(
+            session_id="session-1",
+            turn_id="turn-1",
+            tool_call_id="card-1",
+            tool_name="octo_send_display_card",
+            args={"title": "Result"},
+        )
+        controller.complete(session_id="session-1", turn_id="turn-1")
+        while adapter.pending:
+            await adapter.run_next()
+
+    send.assert_not_awaited()
+    assert controller.state_count == 0
+
+
+
 
 @pytest.mark.asyncio
-async def test_progress_turns_are_isolated_and_session_cancel_drops_pending_work() -> None:
+async def test_progress_turns_are_isolated_and_session_cancel_drops_pending_work() -> (
+    None
+):
     controller = card_progress.CardProgressController()
     adapter = _Adapter()
     send = AsyncMock(
@@ -176,7 +217,9 @@ async def test_progress_turns_are_isolated_and_session_cancel_drops_pending_work
         ]
     )
     with (
-        patch.object(card_progress.api, "get_card_profile", AsyncMock(return_value=_MANIFEST)),
+        patch.object(
+            card_progress.api, "get_card_profile", AsyncMock(return_value=_MANIFEST)
+        ),
         patch.object(card_progress.api, "send_card_message", send),
     ):
         controller.begin(
@@ -190,6 +233,13 @@ async def test_progress_turns_are_isolated_and_session_cancel_drops_pending_work
             route=_ROUTE,
             session_id="session-2",
             turn_id="turn-2",
+        )
+        controller.tool_started(
+            session_id="session-2",
+            turn_id="turn-2",
+            tool_call_id="call-2",
+            tool_name="read",
+            args={"path": "/tmp/two.py"},
         )
         assert controller.state_count == 2
         controller.cancel_session("session-1")
@@ -206,7 +256,9 @@ async def test_progress_delivery_failure_is_fail_soft() -> None:
     controller = card_progress.CardProgressController()
     adapter = _Adapter()
     with (
-        patch.object(card_progress.api, "get_card_profile", AsyncMock(return_value=_MANIFEST)),
+        patch.object(
+            card_progress.api, "get_card_profile", AsyncMock(return_value=_MANIFEST)
+        ),
         patch.object(
             card_progress.api,
             "send_card_message",
@@ -218,6 +270,13 @@ async def test_progress_delivery_failure_is_fail_soft() -> None:
             route=_ROUTE,
             session_id="session-1",
             turn_id="turn-1",
+        )
+        controller.tool_started(
+            session_id="session-1",
+            turn_id="turn-1",
+            tool_call_id="call-1",
+            tool_name="read",
+            args={"path": "/tmp/input.py"},
         )
         await adapter.run_next()
 
@@ -305,8 +364,8 @@ async def test_failed_turn_finalizes_as_stopped_and_closes_running_tools() -> No
         )
         await adapter.run_next()
 
-    final = edit.await_args.kwargs
-    assert final["transient"] is False
+    edit.assert_not_awaited()
+    final = send.await_args.kwargs
     assert final["plain"].startswith("Stopped")
     assert "failed" in final["plain"]
     assert controller.state_count == 0
@@ -316,6 +375,7 @@ async def test_failed_turn_finalizes_as_stopped_and_closes_running_tools() -> No
 async def test_progress_keeps_rendering_after_more_than_32_tool_calls() -> None:
     controller = card_progress.CardProgressController()
     adapter = _Adapter()
+    send = AsyncMock(return_value=SendMessageResult(message_id="progress-1"))
     edit = AsyncMock(return_value={})
     with (
         patch.object(
@@ -326,7 +386,7 @@ async def test_progress_keeps_rendering_after_more_than_32_tool_calls() -> None:
         patch.object(
             card_progress.api,
             "send_card_message",
-            AsyncMock(return_value=SendMessageResult(message_id="progress-1")),
+            send,
         ),
         patch.object(card_progress.api, "edit_card_message", edit),
     ):
@@ -347,5 +407,339 @@ async def test_progress_keeps_rendering_after_more_than_32_tool_calls() -> None:
         controller.complete(session_id="session-1", turn_id="turn-1")
         await adapter.run_next()
 
-    edit.assert_awaited_once()
+    send.assert_awaited_once()
+    edit.assert_not_awaited()
     assert controller.state_count == 0
+
+
+def test_reasoning_process_data_matches_openclaw_summary_contract() -> None:
+    data = cards.build_reasoning_process_data(
+        phase="completed",
+        tools=[
+            {
+                "tool_name": "__thinking__",
+                "status": "complete",
+                "thought": "Inspect the relevant implementation.",
+                "duration_ms": 1_200,
+            },
+            {
+                "tool_name": "read",
+                "status": "complete",
+                "summary": "…/src/cards.py",
+                "result_summary": "42 results",
+                "duration_ms": 300,
+            },
+            {
+                "tool_name": "bash",
+                "status": "failed",
+                "summary": "pytest",
+                "error": "command failed",
+                "duration_ms": 800,
+            },
+        ],
+        elapsed_ms=12_000,
+        reasoning_id="session-1:turn-1",
+    )
+
+    assert data["state"] == "completed"
+    assert data["statusLabel"] == "Done"
+    assert data["traceExpanded"] is False
+    assert data["traceCollapsed"] is True
+    assert data["timerText"] == "12.0s · 1 phase · 2 tool calls"
+    assert data["phases"] == [
+        {
+            "thought": "Inspect the relevant implementation.",
+            "actions": [
+                {
+                    "tool": "read",
+                    "detail": "…/src/cards.py · 42 results",
+                    "statusGlyph": "●",
+                    "statusTone": "Good",
+                },
+                {
+                    "tool": "bash",
+                    "detail": "pytest · command failed",
+                    "statusGlyph": "●",
+                    "statusTone": "Attention",
+                },
+            ],
+        }
+    ]
+
+
+def test_reasoning_process_renderer_uses_collapsed_terminal_trace() -> None:
+    rendered = cards.build_reasoning_process_card(
+        phase="completed",
+        tools=[
+            {
+                "tool_name": "__thinking__",
+                "status": "complete",
+                "thought": "Check the implementation.",
+            },
+            {
+                "tool_name": "read",
+                "status": "complete",
+                "summary": "…/src/cards.py",
+                "result_summary": "completed",
+            },
+        ],
+        elapsed_ms=2_000,
+        reasoning_id="session-1:turn-1",
+        capabilities=cards.CardCapabilities(
+            available=True,
+            enabled=True,
+            elements=frozenset({"TextBlock", "Container", "ColumnSet", "ActionSet"}),
+            actions=frozenset({"Action.ToggleVisibility"}),
+        ),
+    )
+
+    body = rendered.card["body"]
+    assert rendered.card["metadata"] == {"octo_layout": "agent_progress_v1"}
+    assert body[0]["id"] == "octo-surface-accent-header-reasoning-active"
+    assert body[1]["id"] == "trace_panel"
+    assert body[1]["isVisible"] is False
+    assert body[2]["id"] == "collapsed_panel"
+    assert body[2]["isVisible"] is True
+    toggle = body[3]["items"][0]["actions"][0]
+    assert toggle == {
+        "type": "Action.ToggleVisibility",
+        "id": "reasoning_toggle",
+        "title": "Show / hide reasoning",
+        "targetElements": ["trace_panel", "collapsed_panel"],
+    }
+    assert rendered.plain.startswith("Done · 2.0s · 1 phase · 1 tool call")
+    assert "Check the implementation." in rendered.plain
+    assert "read · …/src/cards.py · completed" in rendered.plain
+
+
+def test_reasoning_summary_never_uses_raw_cot_or_tool_output() -> None:
+    assert (
+        cards.sanitize_reasoning_thought("Authorization: Bearer abcdefghijklmnop")
+        == "Thinking through…"
+    )
+    assert (
+        cards.summarize_tool_result(
+            "bash",
+            {
+                "details": {"exitCode": 0},
+                "content": [{"type": "text", "text": "Bearer raw-secret"}],
+            },
+        )
+        == "exit 0"
+    )
+    assert (
+        cards.summarize_tool_result(
+            "read",
+            {"content": "complete file contents"},
+        )
+        == "completed"
+    )
+
+
+def test_api_hooks_capture_only_public_reasoning_summary() -> None:
+    controller = MagicMock()
+    with (
+        patch.object(card_progress, "_CONTROLLER", controller),
+        patch.object(
+            card_progress,
+            "_reasoning_summaries_enabled",
+            return_value=True,
+        ),
+    ):
+        card_progress.on_pre_api_request(
+            platform="octo",
+            session_id="session-1",
+            turn_id="turn-1",
+            api_request_id="api-1",
+        )
+        card_progress.on_post_api_request(
+            platform="octo",
+            session_id="session-1",
+            turn_id="turn-1",
+            api_request_id="api-1",
+            api_duration=1.25,
+            assistant_message={
+                "reasoning": "raw hidden chain of thought",
+                "reasoning_content": "raw provider scratchpad",
+                "reasoning_details": [
+                    {
+                        "type": "reasoning.summary",
+                        "summary": "Inspecting the card lifecycle.",
+                    }
+                ],
+                "codex_reasoning_items": [
+                    {
+                        "type": "reasoning",
+                        "encrypted_content": "opaque-hidden-state",
+                        "text": "raw hidden Codex reasoning",
+                        "summary": [
+                            {
+                                "type": "summary_text",
+                                "text": "Checking the negotiated renderer.",
+                            }
+                        ],
+                    }
+                ],
+                "content": None,
+                "tool_calls": [{"id": "call-1"}],
+            },
+        )
+
+    controller.model_started.assert_called_once_with(
+        session_id="session-1",
+        turn_id="turn-1",
+        model_call_id="api-1",
+    )
+    controller.model_finished.assert_called_once_with(
+        session_id="session-1",
+        turn_id="turn-1",
+        model_call_id="api-1",
+        thought="Inspecting the card lifecycle. Checking the negotiated renderer.",
+        duration_ms=1_250,
+        answering=False,
+        failed=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_progress_prefers_compatible_registry_reasoning_template() -> None:
+    controller = card_progress.CardProgressController()
+    adapter = _Adapter()
+    manifest = CardProfileManifest(
+        available=True,
+        enabled=True,
+        templating=types.CardTemplatingCapability(
+            supported=True,
+            wire="template-ref/v1",
+            templates=(
+                types.CardTemplateCapability(
+                    id="ai.reasoning-process",
+                    version="0.3.0",
+                    views=(
+                        types.CardTemplateViewCapability(
+                            name="active",
+                            wire_profile="octo/v2",
+                            states=("reasoning", "answering"),
+                        ),
+                        types.CardTemplateViewCapability(
+                            name="error",
+                            wire_profile="octo/v2",
+                            states=("error",),
+                        ),
+                        types.CardTemplateViewCapability(
+                            name="result",
+                            wire_profile="octo/v1",
+                            states=("completed", "stopped"),
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+    send_template = AsyncMock(return_value=SendMessageResult(message_id="reasoning-1"))
+    edit_template = AsyncMock(return_value={})
+    with (
+        patch.object(
+            card_progress.api,
+            "get_card_profile",
+            AsyncMock(return_value=manifest),
+        ),
+        patch.object(
+            card_progress,
+            "send_template_card_message",
+            send_template,
+        ),
+        patch.object(
+            card_progress,
+            "edit_template_card_message",
+            edit_template,
+        ),
+        patch.object(card_progress.api, "send_card_message", AsyncMock()) as send,
+    ):
+        controller.begin(
+            adapter=adapter,
+            route=_ROUTE,
+            session_id="session-1",
+            turn_id="turn-1",
+        )
+        controller.model_started(
+            session_id="session-1",
+            turn_id="turn-1",
+            model_call_id="api-1",
+        )
+        controller.model_finished(
+            session_id="session-1",
+            turn_id="turn-1",
+            model_call_id="api-1",
+            thought="Inspect the implementation.",
+            duration_ms=400,
+        )
+        controller.tool_started(
+            session_id="session-1",
+            turn_id="turn-1",
+            tool_call_id="call-1",
+            tool_name="read",
+            args={"path": "/work/src/cards.py"},
+        )
+        await adapter.run_next()
+        controller.tool_finished(
+            session_id="session-1",
+            turn_id="turn-1",
+            tool_call_id="call-1",
+            tool_name="read",
+            status="ok",
+            duration_ms=200,
+            result={"match_count": 7, "content": "must not be rendered"},
+        )
+        await adapter.run_next()
+        controller.complete(session_id="session-1", turn_id="turn-1")
+        await adapter.run_next()
+
+    send.assert_not_awaited()
+    assert send_template.await_args.kwargs["template_ref"] == {
+        "id": "ai.reasoning-process",
+        "version": "0.3.0",
+    }
+    assert send_template.await_args.kwargs["data"]["state"] == "reasoning"
+    assert edit_template.await_args_list[-1].kwargs["state"] == "completed"
+    assert edit_template.await_args_list[-1].kwargs["transient"] is False
+    final_data = edit_template.await_args_list[-1].kwargs["data"]
+    assert final_data["timerText"].endswith("1 tool call")
+    assert final_data["phases"][0]["actions"][0]["detail"].endswith("7 results")
+@pytest.mark.parametrize("action", ["reasoning_stop", "reasoning_retry"])
+def test_registry_reasoning_template_rejects_unhandled_submit_actions(
+    action: str,
+) -> None:
+    templating = types.CardTemplatingCapability(
+        supported=True,
+        wire="template-ref/v1",
+        templates=(
+            types.CardTemplateCapability(
+                id="ai.reasoning-process",
+                version="0.3.0",
+                views=(
+                    types.CardTemplateViewCapability(
+                        name="active",
+                        wire_profile="octo/v2",
+                        states=("reasoning", "answering"),
+                        submit_actions=(action,) if action == "reasoning_stop" else (),
+                    ),
+                    types.CardTemplateViewCapability(
+                        name="error",
+                        wire_profile="octo/v2",
+                        states=("error",),
+                        submit_actions=(action,) if action == "reasoning_retry" else (),
+                    ),
+                    types.CardTemplateViewCapability(
+                        name="result",
+                        wire_profile="octo/v1",
+                        states=("completed", "stopped"),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    assert cards.select_reasoning_process_template(templating) is None

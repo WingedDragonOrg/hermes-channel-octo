@@ -18,6 +18,7 @@ from .types import (
     CARD_PROFILE_V2,
     CARD_VERSION,
     CardProfileManifest,
+    CardTemplatingCapability,
     MessageType,
 )
 
@@ -127,28 +128,16 @@ def _positive_limit(value: object) -> int | None:
 def derive_card_capabilities(manifest: CardProfileManifest) -> CardCapabilities:
     """Convert a manifest into authoritative renderer sets and safe limits."""
     authoritative = manifest.available
-    profiles = (
-        frozenset(manifest.profiles or ())
-        if authoritative
-        else None
-    )
+    profiles = frozenset(manifest.profiles or ()) if authoritative else None
     elements = (
         frozenset(manifest.elements or ())
         if authoritative
-        else (
-            frozenset(manifest.elements)
-            if manifest.elements is not None
-            else None
-        )
+        else (frozenset(manifest.elements) if manifest.elements is not None else None)
     )
     inputs = (
         frozenset(manifest.inputs or ())
         if authoritative
-        else (
-            frozenset(manifest.inputs)
-            if manifest.inputs is not None
-            else None
-        )
+        else (frozenset(manifest.inputs) if manifest.inputs is not None else None)
     )
     if authoritative or manifest.actions is not None or manifest.profiles is not None:
         action_values = set(manifest.actions or ())
@@ -170,44 +159,34 @@ def derive_card_capabilities(manifest: CardProfileManifest) -> CardCapabilities:
         authoritative=authoritative,
         max_nodes=_positive_limit(manifest.limits.get("max_nodes")),
         max_depth=_positive_limit(manifest.limits.get("max_depth")),
-        max_payload_bytes=_positive_limit(
-            manifest.limits.get("max_payload_bytes")
-        ),
+        max_payload_bytes=_positive_limit(manifest.limits.get("max_payload_bytes")),
         max_input_text_bytes=_positive_limit(
             manifest.limits.get("max_input_text_bytes")
         ),
-        max_inputs_bytes=_positive_limit(
-            manifest.limits.get("max_inputs_bytes")
-        ),
+        max_inputs_bytes=_positive_limit(manifest.limits.get("max_inputs_bytes")),
     )
 
 
-_MULTI_PART_TLDS = frozenset(
-    {
-        "ac.uk",
-        "co.jp",
-        "co.kr",
-        "co.uk",
-        "com.au",
-        "com.br",
-        "com.cn",
-        "com.hk",
-        "com.sg",
-        "com.tw",
-        "edu.cn",
-        "gov.uk",
-        "gov.cn",
-        "net.cn",
-        "org.cn",
-        "org.uk",
-    }
-)
-_URL_IN_TEXT_RE = re.compile(
-    r"[A-Za-z][A-Za-z0-9+.-]*://[^\s)\]}>\"']+"
-)
-_MARKDOWN_LINK_RE = re.compile(
-    r"\[([^\]\r\n]{0,512})\]\(\s*([^\s)]+)(?:\s+[^)]*)?\)"
-)
+_MULTI_PART_TLDS = frozenset({
+    "ac.uk",
+    "co.jp",
+    "co.kr",
+    "co.uk",
+    "com.au",
+    "com.br",
+    "com.cn",
+    "com.hk",
+    "com.sg",
+    "com.tw",
+    "edu.cn",
+    "gov.uk",
+    "gov.cn",
+    "net.cn",
+    "org.cn",
+    "org.uk",
+})
+_URL_IN_TEXT_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s)\]}>\"']+")
+_MARKDOWN_LINK_RE = re.compile(r"\[([^\]\r\n]{0,512})\]\(\s*([^\s)]+)(?:\s+[^)]*)?\)")
 _PROTOCOL_RELATIVE_RE = re.compile(
     r"(^|[^A-Za-z0-9/:])"
     r"(//[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}"
@@ -324,8 +303,7 @@ def reduce_urls_in_text(text: str) -> str:
     )
     reduced = _PROTOCOL_RELATIVE_RE.sub(
         lambda match: (
-            match.group(1)
-            + (_origin_domain(f"https:{match.group(2)}") or "")
+            match.group(1) + (_origin_domain(f"https:{match.group(2)}") or "")
         ),
         reduced,
     )
@@ -340,8 +318,7 @@ def reduce_urls_in_text(text: str) -> str:
     )
     return _SCHEMELESS_HOST_PATH_RE.sub(
         lambda match: (
-            match.group(1)
-            + (_origin_domain(f"https://{match.group(2)}") or "")
+            match.group(1) + (_origin_domain(f"https://{match.group(2)}") or "")
         ),
         reduced,
     )
@@ -421,9 +398,7 @@ def summarize_tool_params(
     if strategy is None:
         return ""
     if strategy == "path":
-        summary = _shorten_path(
-            _first_string(params, ("path", "file_path", "file"))
-        )
+        summary = _shorten_path(_first_string(params, ("path", "file_path", "file")))
     elif strategy == "shell":
         summary = _summarize_shell(params)
     elif strategy == "url":
@@ -448,9 +423,8 @@ def safe_tool_label(tool_name: str | None) -> str:
         return "tool"
     if tool_name.startswith("mcp__"):
         return "MCP tool"
-    if (
-        not _SAFE_TOOL_LABEL_RE.fullmatch(tool_name)
-        or is_sensitive(tool_name, generic=True)
+    if not _SAFE_TOOL_LABEL_RE.fullmatch(tool_name) or is_sensitive(
+        tool_name, generic=True
     ):
         return "tool"
     return tool_name
@@ -504,13 +478,9 @@ def count_card_nodes(
     seen.add(marker)
     if isinstance(value, Mapping):
         return (0 if _root else 1) + sum(
-            count_card_nodes(item, _root=False, _seen=seen)
-            for item in value.values()
+            count_card_nodes(item, _root=False, _seen=seen) for item in value.values()
         )
-    return sum(
-        count_card_nodes(item, _root=False, _seen=seen)
-        for item in value
-    )
+    return sum(count_card_nodes(item, _root=False, _seen=seen) for item in value)
 
 
 def card_max_depth(
@@ -563,7 +533,8 @@ def _go_json_bytes(value: object) -> bytes:
         separators=(",", ":"),
     )
     encoded = (
-        encoded.replace("&", r"\u0026")
+        encoded
+        .replace("&", r"\u0026")
         .replace("<", r"\u003c")
         .replace(">", r"\u003e")
         .replace("\u2028", r"\u2028")
@@ -624,8 +595,7 @@ def validate_card_limits(
 
     max_payload_bytes = (
         capabilities.max_payload_bytes
-        if capabilities is not None
-        and capabilities.max_payload_bytes is not None
+        if capabilities is not None and capabilities.max_payload_bytes is not None
         else DEFAULT_MAX_CARD_PAYLOAD_BYTES
     )
     if (
@@ -802,9 +772,11 @@ def build_display_card(
                 raise ValueError("display image URL must be a safe http URL")
             line = f"{clean_alt}: {origin}"
             if capabilities is None or _supports(capabilities.elements, "Image"):
-                body.append(
-                    {"type": "Image", "url": resource_url, "altText": clean_alt}
-                )
+                body.append({
+                    "type": "Image",
+                    "url": resource_url,
+                    "altText": clean_alt,
+                })
             else:
                 _require_element(capabilities, "TextBlock")
                 body.append(_text_element(line))
@@ -832,18 +804,19 @@ def build_display_card(
                 if clean_label is None:
                     continue
                 safe_url = sanitize_action_url(url)
-                actions.append(
-                    {"type": "Action.OpenUrl", "title": clean_label, "url": safe_url}
-                )
+                actions.append({
+                    "type": "Action.OpenUrl",
+                    "title": clean_label,
+                    "url": safe_url,
+                })
                 lines.append(f"{clean_label}: {safe_url}")
             if not actions:
                 continue
             can_render_actions = (
-                (capabilities is None or _supports(capabilities.elements, "ActionSet"))
-                and (
-                    capabilities is None
-                    or _supports(capabilities.actions, "Action.OpenUrl")
-                )
+                capabilities is None or _supports(capabilities.elements, "ActionSet")
+            ) and (
+                capabilities is None
+                or _supports(capabilities.actions, "Action.OpenUrl")
             )
             if can_render_actions:
                 body.append({"type": "ActionSet", "actions": actions})
@@ -932,15 +905,10 @@ def _sanitize_action_data(
     if isinstance(value, (list, tuple)):
         if len(value) > 50:
             raise ValueError("action data exceeds item limit")
-        return [
-            _sanitize_action_data(item, depth=depth + 1)
-            for item in value
-        ]
+        return [_sanitize_action_data(item, depth=depth + 1) for item in value]
     if isinstance(value, Mapping):
         sanitized: dict[str, object] = {}
-        for index, (child_key, child_value) in enumerate(
-            islice(value.items(), 51)
-        ):
+        for index, (child_key, child_value) in enumerate(islice(value.items(), 51)):
             if index == 50:
                 raise ValueError("action data exceeds item limit")
             if not isinstance(child_key, str):
@@ -969,10 +937,7 @@ def _require_card_id(value: object, field: str) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{field} must be a safe identifier")
     candidate = value.strip()
-    if (
-        not _CARD_ID_RE.fullmatch(candidate)
-        or is_sensitive(candidate, generic=True)
-    ):
+    if not _CARD_ID_RE.fullmatch(candidate) or is_sensitive(candidate, generic=True):
         raise ValueError(f"{field} must be a safe identifier")
     return candidate
 
@@ -1043,14 +1008,12 @@ def build_interactive_card(
             field="text",
             max_chars=_MAX_INTERACTIVE_TEXT_CHARS,
         )
-        body.append(
-            {
-                "type": "TextBlock",
-                "text": clean_text,
-                "wrap": True,
-                "spacing": "Small",
-            }
-        )
+        body.append({
+            "type": "TextBlock",
+            "text": clean_text,
+            "wrap": True,
+            "spacing": "Small",
+        })
         plain_lines.append(clean_text)
 
     used_ids: set[str] = set()
@@ -1086,10 +1049,14 @@ def build_interactive_card(
             )
         if kind == "choice":
             raw_choices = raw_input.get("choices")
-            if not isinstance(raw_choices, Sequence) or isinstance(
-                raw_choices,
-                (str, bytes),
-            ) or not raw_choices:
+            if (
+                not isinstance(raw_choices, Sequence)
+                or isinstance(
+                    raw_choices,
+                    (str, bytes),
+                )
+                or not raw_choices
+            ):
                 raise ValueError(f"choice input {input_id} requires choices")
             choices: list[dict[str, str]] = []
             choice_values: set[str] = set()
@@ -1144,7 +1111,6 @@ def build_interactive_card(
             )
         else:
             plain_lines.append(f"[{node.get('label', input_id)}]")
-
 
     actions: list[dict[str, Any]] = []
     action_labels: dict[str, str] = {}
@@ -1206,6 +1172,820 @@ def build_interactive_card(
     )
 
 
+_REASONING_TEMPLATE_ID = "ai.reasoning-process"
+_REASONING_TEMPLATE_WIRE = "template-ref/v1"
+_REASONING_FALLBACK_THOUGHT = "Thinking through…"
+_REASONING_THOUGHT_MAX = 280
+_REASONING_TOOL_NAME_MAX = 80
+_REASONING_MAX_PHASES = 6
+_REASONING_MAX_ACTIONS = 12
+_REASONING_PHASE_NAMES = {
+    "starting": "reasoning",
+    "thinking": "reasoning",
+    "running": "reasoning",
+    "tool": "reasoning",
+    "paused": "reasoning",
+    "resuming": "reasoning",
+    "answering": "answering",
+    "completed": "completed",
+    "done": "completed",
+    "stopped": "stopped",
+    "failed": "error",
+    "error": "error",
+    "expired": "error",
+}
+_REASONING_STATUS_MAP = {
+    "running": "running",
+    "complete": "done",
+    "completed": "done",
+    "done": "done",
+    "ok": "done",
+    "failed": "error",
+    "error": "error",
+    "cancelled": "error",
+}
+_REASONING_REQUIRED_VIEWS = {
+    "active": (
+        "octo/v2",
+        frozenset({"reasoning", "answering"}),
+        frozenset({"reasoning_stop"}),
+    ),
+    "error": (
+        "octo/v2",
+        frozenset({"error"}),
+        frozenset({"reasoning_retry"}),
+    ),
+    "result": (
+        "octo/v1",
+        frozenset({"completed", "stopped"}),
+        frozenset(),
+    ),
+}
+
+
+def select_reasoning_process_template(
+    templating: CardTemplatingCapability | None,
+) -> dict[str, str] | None:
+    """Select the sole Registry template compatible with the reasoning contract."""
+    if (
+        templating is None
+        or not templating.supported
+        or templating.wire != _REASONING_TEMPLATE_WIRE
+    ):
+        return None
+    claimed = [
+        template
+        for template in templating.templates
+        if template.id == _REASONING_TEMPLATE_ID
+    ]
+    compatible = []
+    for template in claimed:
+        if not template.version or template.version.strip() != template.version:
+            continue
+        valid = True
+        for view_name, (
+            wire_profile,
+            required_states,
+            _allowed_actions,
+        ) in _REASONING_REQUIRED_VIEWS.items():
+            views = [view for view in template.views if view.name == view_name]
+            if len(views) != 1:
+                valid = False
+                break
+            view = views[0]
+            if (
+                view.wire_profile != wire_profile
+                or not required_states.issubset(view.states)
+                or view.submit_actions
+            ):
+                valid = False
+                break
+        if valid:
+            compatible.append(template)
+    if len(compatible) != 1:
+        return None
+    selected = compatible[0]
+    if sum(template.version == selected.version for template in claimed) != 1:
+        return None
+    return {"id": selected.id, "version": selected.version}
+
+
+def format_progress_duration(duration_ms: object) -> str:
+    """Format milliseconds exactly like OpenClaw's reasoning card."""
+    if (
+        isinstance(duration_ms, bool)
+        or not isinstance(duration_ms, (int, float))
+        or not math.isfinite(duration_ms)
+        or duration_ms < 0
+    ):
+        return ""
+    if duration_ms < 1_000:
+        return f"{duration_ms:g}ms"
+    total_seconds = round(duration_ms / 1_000)
+    if total_seconds < 60:
+        return f"{duration_ms / 1_000:.1f}s"
+    seconds = total_seconds % 60
+    total_minutes = total_seconds // 60
+    minutes = total_minutes % 60
+    hours = total_minutes // 60
+    if hours:
+        return f"{hours}h {minutes}m {seconds}s"
+    return f"{total_minutes}m {seconds}s"
+
+
+def sanitize_reasoning_thought(text: object) -> str:
+    """Return a bounded public reasoning summary, never raw protected content."""
+    if not isinstance(text, str) or not text:
+        return _REASONING_FALLBACK_THOUGHT
+    normalized = re.sub(
+        r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]",
+        " ",
+        text,
+    )
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if (
+        not normalized
+        or "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>" in normalized
+        or "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>" in normalized
+    ):
+        return _REASONING_FALLBACK_THOUGHT
+    try:
+        clean = sanitize_visible_text(normalized)
+    except CardLimitError:
+        return _REASONING_FALLBACK_THOUGHT
+    if not clean:
+        return _REASONING_FALLBACK_THOUGHT
+    if len(clean) > _REASONING_THOUGHT_MAX:
+        return f"{clean[:_REASONING_THOUGHT_MAX]}…"
+    return clean
+
+
+def _finite_count(value: object) -> int | None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        return None
+    return math.floor(value)
+
+
+def summarize_tool_result(tool_name: str | None, result: object) -> str:
+    """Summarize only allowlisted structural result fields."""
+    if result is None:
+        return ""
+    if isinstance(result, list):
+        return f"{len(result)} results"
+    if not isinstance(result, Mapping):
+        return "completed"
+    records: list[Mapping[str, object]] = [result]
+    for key in ("details", "meta", "metadata", "summary"):
+        value = result.get(key)
+        if isinstance(value, Mapping):
+            records.append(value)
+    if tool_name in {"exec", "bash", "shell", "process"}:
+        for record in records:
+            for key in ("exitCode", "exit_code", "code"):
+                count = _finite_count(record.get(key))
+                if count is not None:
+                    return f"exit {count}"
+    for record in records:
+        for key in (
+            "matchCount",
+            "match_count",
+            "resultCount",
+            "result_count",
+            "totalCount",
+            "total_count",
+        ):
+            count = _finite_count(record.get(key))
+            if count is not None:
+                return f"{count} results"
+    for record in records:
+        for key in ("fileCount", "file_count", "changedFiles"):
+            count = _finite_count(record.get(key))
+            if count is not None:
+                return f"{count} files"
+        for key in ("bytes", "byteLength", "writtenBytes"):
+            count = _finite_count(record.get(key))
+            if count is not None:
+                return f"{count} bytes"
+    for record in records:
+        status = record.get("status")
+        if not isinstance(status, str):
+            continue
+        normalized = status.lower()
+        if normalized in {"accepted", "queued", "waiting"}:
+            return normalized
+        if normalized in {
+            "completed",
+            "complete",
+            "success",
+            "succeeded",
+            "ok",
+            "done",
+        }:
+            return "completed"
+    return "completed"
+
+
+def _reasoning_status(tool: Mapping[str, object]) -> str:
+    status = tool.get("status")
+    if not isinstance(status, str) or status not in _REASONING_STATUS_MAP:
+        raise ValueError("unsupported progress tool status")
+    return _REASONING_STATUS_MAP[status]
+
+
+def _reasoning_tool_name(tool_name: object) -> str:
+    if tool_name == "__thinking__":
+        return "think"
+    if tool_name == "__subagent_wait__":
+        return "wait"
+    if not isinstance(tool_name, str):
+        return "tool"
+    try:
+        reduced = re.sub(r"\s+", " ", reduce_urls_in_text(tool_name)).strip()
+    except CardLimitError:
+        return "tool"
+    if not reduced or is_sensitive(reduced, generic=True):
+        return "tool"
+    if len(reduced) > _REASONING_TOOL_NAME_MAX:
+        return f"{reduced[:_REASONING_TOOL_NAME_MAX]}…"
+    return reduced
+
+
+def _reasoning_action(tool: Mapping[str, object]) -> dict[str, str]:
+    status = _reasoning_status(tool)
+    tool_name = tool.get("tool_name")
+    if tool_name == "__subagent_wait__":
+        label = "Waiting for subtask…" if status == "running" else "Subtask returned"
+        duration = format_progress_duration(tool.get("duration_ms"))
+        detail = f"{label} · {duration}" if duration else label
+    else:
+        summary = tool.get("summary")
+        safe_summary = (
+            sanitize_visible_text(summary, generic=False)
+            if isinstance(summary, str)
+            else None
+        )
+        result_summary = tool.get("result_summary")
+        safe_result = (
+            sanitize_visible_text(result_summary)
+            if isinstance(result_summary, str)
+            else None
+        )
+        error = sanitize_error_text(tool.get("error"))
+        parts = [
+            part
+            for part in (
+                safe_summary,
+                error if status == "error" else safe_result,
+            )
+            if part
+        ]
+        if parts:
+            detail = " · ".join(parts)
+        elif status == "running":
+            detail = "Running…"
+        elif status == "error":
+            detail = "Call failed"
+        else:
+            detail = "Completed"
+    return {
+        "tool": _reasoning_tool_name(tool_name),
+        "detail": detail,
+        "statusGlyph": "●",
+        "statusTone": (
+            "Accent"
+            if status == "running"
+            else "Attention"
+            if status == "error"
+            else "Good"
+        ),
+    }
+
+
+def _reasoning_phases(
+    tools: Sequence[Mapping[str, object]],
+    *,
+    synthesize_empty_actions: bool,
+) -> list[dict[str, object]]:
+    phases: list[dict[str, object]] = []
+    current: dict[str, object] | None = None
+    thinking_steps: list[Mapping[str, object]] = []
+    for tool in tools:
+        if not isinstance(tool, Mapping):
+            raise ValueError("progress tool entries must be objects")
+        if tool.get("tool_name") == "__thinking__":
+            _reasoning_status(tool)
+            thinking_steps.append(tool)
+            current = {
+                "thought": sanitize_reasoning_thought(tool.get("thought")),
+                "actions": [],
+            }
+            phases.append(current)
+            continue
+        if current is None:
+            current = {
+                "thought": _REASONING_FALLBACK_THOUGHT,
+                "actions": [],
+            }
+            phases.append(current)
+        actions = current["actions"]
+        assert isinstance(actions, list)
+        actions.append(_reasoning_action(tool))
+    if not phases:
+        phases.append({"thought": _REASONING_FALLBACK_THOUGHT, "actions": []})
+    if not synthesize_empty_actions:
+        return phases
+    for index, phase in enumerate(phases):
+        actions = phase["actions"]
+        assert isinstance(actions, list)
+        if actions:
+            continue
+        thinking = thinking_steps[index] if index < len(thinking_steps) else None
+        status = _reasoning_status(thinking) if thinking is not None else "done"
+        detail = (
+            "Planning next step…"
+            if status == "running"
+            else "Phase stopped"
+            if status == "error"
+            else "Phase complete"
+        )
+        duration = (
+            format_progress_duration(thinking.get("duration_ms"))
+            if thinking is not None
+            else ""
+        )
+        actions.append({
+            "tool": "think",
+            "detail": f"{detail} · {duration}" if duration else detail,
+            "statusGlyph": "●",
+            "statusTone": (
+                "Accent"
+                if status == "running"
+                else "Attention"
+                if status == "error"
+                else "Good"
+            ),
+        })
+    return phases
+
+
+def _trim_reasoning_phases(
+    phases: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    remaining = _REASONING_MAX_ACTIONS
+    visible: list[dict[str, object]] = []
+    for phase in reversed(phases[-_REASONING_MAX_PHASES:]):
+        if remaining <= 0:
+            break
+        raw_actions = phase.get("actions")
+        actions = list(raw_actions) if isinstance(raw_actions, list) else []
+        actions = actions[-remaining:]
+        remaining -= len(actions)
+        visible.append({
+            "thought": phase.get("thought", _REASONING_FALLBACK_THOUGHT),
+            "actions": actions,
+        })
+    visible.reverse()
+    return visible
+
+
+def _reasoning_process_data(
+    *,
+    phase: str,
+    tools: Sequence[Mapping[str, object]],
+    elapsed_ms: object,
+    reasoning_id: str,
+    phases: list[dict[str, object]],
+) -> dict[str, object]:
+    state = _REASONING_PHASE_NAMES.get(phase)
+    if state is None:
+        raise ValueError("unsupported progress card phase")
+    elapsed = format_progress_duration(elapsed_ms) or "0ms"
+    tool_count = sum(
+        tool.get("tool_name") not in {"__thinking__", "__subagent_wait__"}
+        for tool in tools
+    )
+    phase_count = len(phases)
+    phase_label = f"{phase_count} {'phase' if phase_count == 1 else 'phases'}"
+    tool_label = f"{tool_count} {'tool call' if tool_count == 1 else 'tool calls'}"
+    active = state in {"reasoning", "answering"}
+    error_message = (
+        "Timed out waiting for the background task."
+        if phase == "expired"
+        else "Reasoning was interrupted. Completed steps were preserved."
+    )
+    data: dict[str, object] = {
+        "reasoningId": reasoning_id.strip() or "octo-progress",
+        "state": state,
+        "title": "Reasoning",
+        "statusLabel": (
+            "Thinking"
+            if state == "reasoning"
+            else "Answering"
+            if state == "answering"
+            else "Done"
+            if state == "completed"
+            else "Stopped"
+            if state == "stopped"
+            else "Failed"
+        ),
+        "statusTone": (
+            "Accent"
+            if state in {"reasoning", "answering"}
+            else "Good"
+            if state == "completed"
+            else "Warning"
+            if state == "stopped"
+            else "Attention"
+        ),
+        "timerText": (
+            "Reasoning…"
+            if state == "reasoning"
+            else "Writing the answer…"
+            if state == "answering"
+            else f"{elapsed} · stopped at phase {phase_count}"
+            if state == "stopped"
+            else "Interrupted"
+            if state == "error"
+            else f"{elapsed} · {phase_label} · {tool_label}"
+        ),
+        "traceExpanded": active or state == "error",
+        "traceCollapsed": not active and state != "error",
+        "collapsedSummary": (
+            "Reasoning complete · answer in progress"
+            if state == "answering"
+            else f"Kept {phase_label} from before the stop"
+            if state == "stopped"
+            else "Interrupted · open to see the steps so far"
+            if state == "error"
+            else f"{elapsed} · trace collapsed"
+            if state == "completed"
+            else "Reasoning in progress · open to follow along"
+        ),
+        "phases": phases,
+    }
+    if state == "reasoning":
+        data["progressText"] = (
+            "Waiting for subtask…"
+            if phase == "paused"
+            else "Subtask returned. Wrapping up…"
+            if phase == "resuming"
+            else "Working through…"
+        )
+    elif state == "answering":
+        data["progressText"] = "Reasoning complete. Writing the answer…"
+    elif state == "error":
+        data["errorTitle"] = "Generation failed"
+        data["errorMessage"] = error_message
+    return data
+
+
+def build_reasoning_process_data(
+    *,
+    phase: str,
+    tools: Sequence[Mapping[str, object]],
+    elapsed_ms: object = None,
+    reasoning_id: str = "",
+) -> dict[str, object]:
+    """Build the local OpenClaw-compatible reasoning view model."""
+    phases = _reasoning_phases(tools, synthesize_empty_actions=True)
+    return _reasoning_process_data(
+        phase=phase,
+        tools=tools,
+        elapsed_ms=elapsed_ms,
+        reasoning_id=reasoning_id,
+        phases=phases,
+    )
+
+
+def build_reasoning_process_wire_data(
+    *,
+    phase: str,
+    tools: Sequence[Mapping[str, object]],
+    elapsed_ms: object = None,
+    reasoning_id: str = "",
+) -> dict[str, object] | None:
+    """Build bounded Registry data without synthetic actions."""
+    phases = [
+        item
+        for item in _reasoning_phases(
+            tools,
+            synthesize_empty_actions=False,
+        )
+        if item["actions"]
+    ]
+    if not phases:
+        return None
+    phases = _trim_reasoning_phases(phases)
+    return _reasoning_process_data(
+        phase=phase,
+        tools=tools,
+        elapsed_ms=elapsed_ms,
+        reasoning_id=reasoning_id,
+        phases=phases,
+    )
+
+
+def _reasoning_text_block(
+    text: str,
+    **extra: object,
+) -> dict[str, object]:
+    return {"type": "TextBlock", "text": text, "wrap": True, **extra}
+
+
+def _reasoning_action_row(
+    action: Mapping[str, object],
+    *,
+    first: bool,
+) -> dict[str, object]:
+    return {
+        "type": "ColumnSet",
+        "spacing": "None" if first else "Small",
+        "columns": [
+            {
+                "type": "Column",
+                "width": "auto",
+                "items": [
+                    _reasoning_text_block(
+                        str(action["statusGlyph"]),
+                        color=str(action["statusTone"]),
+                        size="Small",
+                        spacing="None",
+                    )
+                ],
+            },
+            {
+                "type": "Column",
+                "width": "auto",
+                "items": [
+                    _reasoning_text_block(
+                        str(action["tool"]),
+                        weight="Bolder",
+                        size="Small",
+                        spacing="None",
+                    )
+                ],
+            },
+            {
+                "type": "Column",
+                "width": "stretch",
+                "items": [
+                    _reasoning_text_block(
+                        str(action["detail"]),
+                        isSubtle=True,
+                        size="Small",
+                        spacing="None",
+                    )
+                ],
+            },
+        ],
+    }
+
+
+def _reasoning_phase_block(
+    phase: Mapping[str, object],
+    *,
+    first: bool,
+) -> dict[str, object]:
+    raw_actions = phase["actions"]
+    assert isinstance(raw_actions, list)
+    return {
+        "type": "Container",
+        "spacing": "None" if first else "Large",
+        "separator": not first,
+        "items": [
+            _reasoning_text_block(
+                str(phase["thought"]),
+                size="Small",
+                spacing="None",
+            ),
+            {
+                "type": "Container",
+                "style": "emphasis",
+                "spacing": "Small",
+                "items": [
+                    _reasoning_action_row(action, first=index == 0)
+                    for index, action in enumerate(raw_actions)
+                    if isinstance(action, Mapping)
+                ],
+            },
+        ],
+    }
+
+
+def build_reasoning_process_card(
+    *,
+    phase: str,
+    tools: Sequence[Mapping[str, object]],
+    elapsed_ms: object = None,
+    reasoning_id: str = "",
+    capabilities: CardCapabilities | None = None,
+) -> CardRenderResult:
+    """Render the local toggle-only OpenClaw reasoning card."""
+    fallback_phase = (
+        "completed"
+        if _REASONING_PHASE_NAMES.get(phase) == "completed"
+        else "failed"
+        if _REASONING_PHASE_NAMES.get(phase) in {"error", "stopped"}
+        else "running"
+    )
+    required = {"TextBlock", "Container", "ColumnSet"}
+    if capabilities is not None and any(
+        not _supports(capabilities.elements, element) for element in required
+    ):
+        return build_progress_card(
+            phase=fallback_phase,
+            tools=tools,
+            capabilities=capabilities,
+        )
+    data = build_reasoning_process_data(
+        phase=phase,
+        tools=tools,
+        elapsed_ms=elapsed_ms,
+        reasoning_id=reasoning_id,
+    )
+    raw_phases = data["phases"]
+    assert isinstance(raw_phases, list)
+    phases = _trim_reasoning_phases(raw_phases)
+    data["phases"] = phases
+    can_toggle = (
+        capabilities is not None
+        and _supports(capabilities.elements, "ActionSet")
+        and capabilities.actions is not None
+        and "Action.ToggleVisibility" in capabilities.actions
+    )
+    trace_visible = bool(data["traceExpanded"]) if can_toggle else True
+    body: list[dict[str, object]] = [
+        {
+            "type": "Container",
+            "id": "octo-surface-accent-header-reasoning-active",
+            "style": "accent",
+            "bleed": True,
+            "spacing": "None",
+            "items": [
+                {
+                    "type": "ColumnSet",
+                    "spacing": "None",
+                    "columns": [
+                        {
+                            "type": "Column",
+                            "width": "stretch",
+                            "items": [
+                                _reasoning_text_block(
+                                    f"✦  {data['title']}",
+                                    color="Accent",
+                                    weight="Bolder",
+                                    spacing="None",
+                                ),
+                                _reasoning_text_block(
+                                    str(data["timerText"]),
+                                    size="Small",
+                                    isSubtle=True,
+                                    spacing="Small",
+                                ),
+                            ],
+                        },
+                        {
+                            "type": "Column",
+                            "width": "auto",
+                            "items": [
+                                _reasoning_text_block(
+                                    str(data["statusLabel"]),
+                                    color=data["statusTone"],
+                                    weight="Bolder",
+                                    size="Small",
+                                    spacing="None",
+                                )
+                            ],
+                        },
+                    ],
+                }
+            ],
+        },
+        {
+            "type": "Container",
+            "id": "trace_panel",
+            "isVisible": trace_visible,
+            "spacing": "Large",
+            "items": [
+                *[
+                    _reasoning_phase_block(item, first=index == 0)
+                    for index, item in enumerate(phases)
+                ],
+                *(
+                    [
+                        _reasoning_text_block(
+                            f"◌  {data['progressText']}",
+                            color="Accent",
+                            size="Small",
+                            spacing="Large",
+                        )
+                    ]
+                    if data.get("progressText")
+                    else []
+                ),
+                *(
+                    [
+                        {
+                            "type": "Container",
+                            "style": "attention",
+                            "spacing": "Large",
+                            "items": [
+                                _reasoning_text_block(
+                                    str(data.get("errorTitle", "Generation failed")),
+                                    weight="Bolder",
+                                    color="Attention",
+                                    spacing="None",
+                                ),
+                                _reasoning_text_block(
+                                    str(data["errorMessage"]),
+                                    size="Small",
+                                    spacing="Small",
+                                ),
+                            ],
+                        }
+                    ]
+                    if data.get("errorMessage")
+                    else []
+                ),
+            ],
+        },
+        {
+            "type": "Container",
+            "id": "collapsed_panel",
+            "isVisible": can_toggle and bool(data["traceCollapsed"]),
+            "spacing": "Medium",
+            "items": [
+                _reasoning_text_block(
+                    f"✓  {data['collapsedSummary']}",
+                    size="Small",
+                    isSubtle=True,
+                    spacing="None",
+                )
+            ],
+        },
+    ]
+    if can_toggle:
+        body.append({
+            "type": "Container",
+            "style": "emphasis",
+            "bleed": True,
+            "separator": True,
+            "spacing": "Large",
+            "items": [
+                {
+                    "type": "ActionSet",
+                    "horizontalAlignment": "Right",
+                    "actions": [
+                        {
+                            "type": "Action.ToggleVisibility",
+                            "id": "reasoning_toggle",
+                            "title": "Show / hide reasoning",
+                            "targetElements": [
+                                "trace_panel",
+                                "collapsed_panel",
+                            ],
+                        }
+                    ],
+                }
+            ],
+        })
+    plain_lines = [f"{data['statusLabel']} · {data['timerText']}"]
+    for item in phases:
+        plain_lines.append(str(item["thought"]))
+        actions = item["actions"]
+        assert isinstance(actions, list)
+        for action in actions:
+            if isinstance(action, Mapping):
+                plain_lines.append(f"{action['tool']} · {action['detail']}")
+    if data.get("progressText"):
+        plain_lines.append(str(data["progressText"]))
+    if data.get("errorMessage"):
+        plain_lines.append(str(data["errorMessage"]))
+    result = CardRenderResult(
+        card={
+            "$schema": ADAPTIVE_CARD_SCHEMA,
+            "type": "AdaptiveCard",
+            "version": CARD_VERSION,
+            "body": body,
+            "metadata": {"octo_layout": "agent_progress_v1"},
+        },
+        plain="\n".join(plain_lines) or "[card]",
+    )
+    try:
+        validate_card_limits(result.card, result.plain, capabilities)
+    except CardLimitError:
+        return build_progress_card(
+            phase=fallback_phase,
+            tools=tools,
+            capabilities=capabilities,
+        )
+    return result
+
 
 _PROGRESS_TITLES = {
     "starting": "Working",
@@ -1235,8 +2015,9 @@ def build_progress_card(
         status = tool.get("status")
         if status not in _PROGRESS_STATUSES:
             raise ValueError("unsupported progress tool status")
+        raw_tool_name = tool.get("tool_name")
         label = safe_tool_label(
-            tool.get("tool_name") if isinstance(tool.get("tool_name"), str) else None
+            raw_tool_name if isinstance(raw_tool_name, str) else None
         )
         raw_summary = tool.get("summary")
         if isinstance(raw_summary, str):
@@ -1251,12 +2032,10 @@ def build_progress_card(
                 line = f"{line} - {safe_error}"
         blocks.append({"type": "text", "text": line})
     if not blocks:
-        blocks.append(
-            {
-                "type": "text",
-                "text": "Preparing" if phase == "starting" else title,
-            }
-        )
+        blocks.append({
+            "type": "text",
+            "text": "Preparing" if phase == "starting" else title,
+        })
     flat = build_display_card(
         title=title,
         blocks=blocks,

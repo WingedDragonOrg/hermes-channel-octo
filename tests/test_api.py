@@ -263,6 +263,31 @@ class TestApiFailureTruth:
         session.get.assert_called_once()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "http://100.100.100.200/latest/meta-data/",
+            "http://[fd00:ec2::254]/latest/meta-data/",
+        ],
+    )
+    async def test_outbound_download_policy_never_allows_metadata_hosts(
+        self,
+        url: str,
+    ):
+        session = MagicMock()
+
+        with pytest.raises(RuntimeError, match="unsafe download URL"):
+            await download_file(
+                session,
+                url,
+                enforce_host_safety=False,
+            )
+
+        session.get.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_fetch_user_info_passes_uid_as_query_param(self):
         session = MagicMock()
         session.get = MagicMock(return_value=_UserInfoResponse())
