@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import shlex
 import threading
 import time
 from itertools import islice
@@ -226,19 +227,84 @@ _GENERIC_SECRET_RUN_RE = re.compile(r"[A-Za-z0-9_+/=-]{32,}")
 _SUMMARY_STRATEGY = {
     "apply_patch": "path",
     "bash": "shell",
+    "browser_navigate": "url",
     "edit": "path",
     "exec": "shell",
+    "exec_command": "shell",
     "fetch": "url",
     "find": "path",
-    "glob": "path",
-    "grep": "query",
+    "glob": "query_scope",
+    "grep": "query_scope",
     "ls": "path",
+    "patch": "path",
     "process": "shell",
-    "read": "path",
-    "search": "query",
+    "read": "path_range",
+    "read_file": "path_range",
+    "search": "query_scope",
+    "search_files": "query_scope",
     "shell": "shell",
+    "skill_view": "name",
+    "terminal": "shell",
+    "tool_call": "tool_call",
+    "tool_describe": "name",
+    "tool_search": "query",
+    "web_extract": "url",
     "web_search": "query",
     "write": "path",
+    "write_file": "path",
+}
+_TOOL_LABELS = {
+    "__subagent_wait__": "等待子任务",
+    "__thinking__": "分析问题",
+    "apply_patch": "修改文件",
+    "bash": "运行命令",
+    "browser_back": "返回页面",
+    "browser_click": "点击页面",
+    "browser_console": "查看控制台",
+    "browser_get_images": "查看图片",
+    "browser_navigate": "打开网页",
+    "browser_press": "发送按键",
+    "browser_scroll": "滚动页面",
+    "browser_snapshot": "读取网页",
+    "browser_type": "填写表单",
+    "browser_vision": "查看网页",
+    "clarify": "确认需求",
+    "delegate_task": "安排子任务",
+    "edit": "修改文件",
+    "exec": "运行命令",
+    "exec_command": "运行命令",
+    "fetch": "读取网页",
+    "find": "搜索文件",
+    "glob": "搜索文件",
+    "grep": "搜索文件",
+    "image_generate": "生成图片",
+    "lcm_describe": "查看上下文",
+    "lcm_expand": "展开上下文",
+    "lcm_grep": "检索上下文",
+    "lcm_inspect": "检查上下文",
+    "ls": "列出文件",
+    "memory": "更新记忆",
+    "patch": "修改文件",
+    "process": "运行命令",
+    "read": "读取文件",
+    "read_file": "读取文件",
+    "search": "搜索文件",
+    "search_files": "搜索文件",
+    "session_search": "搜索会话",
+    "shell": "运行命令",
+    "skill_view": "读取技能",
+    "skills_list": "列出技能",
+    "terminal": "运行命令",
+    "text_to_speech": "生成语音",
+    "todo": "更新任务",
+    "tool_call": "调用工具",
+    "tool_describe": "读取工具说明",
+    "tool_search": "查找工具",
+    "vision_analyze": "查看图片",
+    "web_extract": "读取网页",
+    "web_search": "搜索网页",
+    "write": "写入文件",
+    "write_file": "写入文件",
 }
 _PROGRAM_TOKEN_RE = re.compile(r"^[A-Za-z0-9_./@:+-]+$")
 _SAFE_TOOL_LABEL_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
@@ -365,7 +431,7 @@ def _first_string(params: Mapping[str, object], keys: Sequence[str]) -> str:
 
 def _shorten_path(path: str) -> str:
     segments = [segment for segment in re.split(r"[/\\]+", path) if segment]
-    if len(segments) <= 3:
+    if len(segments) <= 2:
         return path
     return f"…/{segments[-2]}/{segments[-1]}"
 
@@ -374,17 +440,111 @@ def _summarize_shell(params: Mapping[str, object]) -> str:
     command = _first_string(params, ("command", "cmd")).strip()
     if not command:
         return ""
-    tokens = command.split()
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return ""
     index = 0
     while index < len(tokens) and re.match(
         r"^[A-Za-z_][A-Za-z0-9_]*=",
         tokens[index],
     ):
         index += 1
-    program = tokens[index] if index < len(tokens) else ""
-    if not _PROGRAM_TOKEN_RE.fullmatch(program):
+    program_token = tokens[index] if index < len(tokens) else ""
+    if not _PROGRAM_TOKEN_RE.fullmatch(program_token):
         return ""
-    return program.rsplit("/", 1)[-1]
+    program = program_token.rsplit("/", 1)[-1]
+    remainder = tokens[index + 1 :]
+    if program == "uv" and remainder:
+        command_name = remainder[0]
+        if command_name == "run":
+            executable = next(
+                (
+                    token.rsplit("/", 1)[-1]
+                    for token in remainder[1:]
+                    if not token.startswith("-")
+                    and _PROGRAM_TOKEN_RE.fullmatch(token)
+                ),
+                "",
+            )
+            return f"uv run {executable}" if executable else "uv run"
+        if command_name in {"build", "lock", "sync"}:
+            return f"uv {command_name}"
+    if program in {"python", "python3"} and len(remainder) >= 2:
+        if remainder[0] == "-m" and _PROGRAM_TOKEN_RE.fullmatch(remainder[1]):
+            return f"{program} -m {remainder[1]}"
+    allowed_subcommands = {
+        "bun": {"run", "test"},
+        "git": {
+            "branch",
+            "checkout",
+            "diff",
+            "fetch",
+            "log",
+            "merge",
+            "pull",
+            "push",
+            "rebase",
+            "restore",
+            "rev-parse",
+            "show",
+            "status",
+            "switch",
+        },
+        "hermes": {"gateway", "plugins"},
+        "npm": {"run", "test"},
+        "pnpm": {"run", "test"},
+        "yarn": {"run", "test"},
+    }
+    first = remainder[0] if remainder else ""
+    if first in allowed_subcommands.get(program, set()):
+        return f"{program} {first}"
+    return program
+
+
+def _line_range_summary(params: Mapping[str, object]) -> str:
+    offset = params.get("offset")
+    limit = params.get("limit")
+    if (
+        isinstance(offset, int)
+        and not isinstance(offset, bool)
+        and offset > 0
+    ):
+        if (
+            isinstance(limit, int)
+            and not isinstance(limit, bool)
+            and limit > 0
+        ):
+            return f"第 {offset}–{offset + limit - 1} 行"
+        return f"从第 {offset} 行"
+    start = params.get("start_line")
+    end = params.get("end_line")
+    if (
+        isinstance(start, int)
+        and not isinstance(start, bool)
+        and start > 0
+    ):
+        if (
+            isinstance(end, int)
+            and not isinstance(end, bool)
+            and end >= start
+        ):
+            return f"第 {start}–{end} 行"
+        return f"从第 {start} 行"
+    return ""
+
+
+def _tool_call_parts(
+    params: Mapping[str, object],
+) -> tuple[str, Mapping[str, object] | None]:
+    name = _first_string(params, ("name", "tool_name", "tool")).strip()
+    raw_arguments = params.get("arguments")
+    if raw_arguments is None:
+        raw_arguments = params.get("args")
+    if raw_arguments is None:
+        raw_arguments = params.get("params")
+    arguments = raw_arguments if isinstance(raw_arguments, Mapping) else None
+    return name, arguments
 
 
 def summarize_tool_params(
@@ -397,19 +557,52 @@ def summarize_tool_params(
     strategy = _SUMMARY_STRATEGY.get(tool_name)
     if strategy is None:
         return ""
-    if strategy == "path":
-        summary = _shorten_path(_first_string(params, ("path", "file_path", "file")))
+    if strategy == "tool_call":
+        inner_name, inner_args = _tool_call_parts(params)
+        if (
+            inner_name == tool_name
+            or inner_name not in _SUMMARY_STRATEGY
+            or inner_args is None
+        ):
+            return ""
+        return summarize_tool_params(inner_name, inner_args)
+    if strategy in {"path", "path_range"}:
+        path = _shorten_path(_first_string(params, ("path", "file_path", "file")))
+        parts = [path] if path else []
+        if strategy == "path_range":
+            line_range = _line_range_summary(params)
+            if line_range:
+                parts.append(line_range)
+        summary = " · ".join(parts)
     elif strategy == "shell":
         summary = _summarize_shell(params)
     elif strategy == "url":
         raw_url = _first_string(params, ("url",))
         summary = _origin_domain(raw_url) or ""
+    elif strategy == "name":
+        summary = _first_string(
+            params,
+            ("name", "tool_name", "skill_name", "skill"),
+        )
+    elif strategy == "query_scope":
+        raw_query = _first_string(params, ("query", "pattern"))
+        safe_query = sanitize_visible_text(raw_query) if raw_query else None
+        raw_path = _first_string(params, ("path", "root", "directory"))
+        short_path = _shorten_path(raw_path) if raw_path else ""
+        safe_path = (
+            sanitize_visible_text(short_path, generic=False)
+            if short_path
+            else None
+        )
+        summary = " · ".join(
+            part for part in (safe_query, safe_path) if part
+        )
     else:
         summary = _first_string(params, ("query", "pattern"))
     summary = re.sub(r"\s+", " ", reduce_urls_in_text(summary)).strip()
     if not summary or is_sensitive(
         summary,
-        generic=strategy in {"query", "url"},
+        generic=strategy in {"query", "query_scope", "url", "name"},
     ):
         return ""
     if len(summary) > _SUMMARY_MAX_CHARS:
@@ -428,6 +621,25 @@ def safe_tool_label(tool_name: str | None) -> str:
     ):
         return "tool"
     return tool_name
+
+
+def localized_tool_label(
+    tool_name: str | None,
+    params: object = None,
+) -> str:
+    """Return a Chinese user-facing label for known Hermes tools."""
+    if tool_name == "tool_call" and isinstance(params, Mapping):
+        inner_name, inner_args = _tool_call_parts(params)
+        if inner_name != tool_name and inner_name in _TOOL_LABELS:
+            return localized_tool_label(inner_name, inner_args)
+    if tool_name in _TOOL_LABELS:
+        return _TOOL_LABELS[tool_name]
+    safe = safe_tool_label(tool_name)
+    if safe == "MCP tool":
+        return "扩展工具"
+    if safe == "tool":
+        return "工具"
+    return safe
 
 
 def sanitize_error_text(error: object) -> str:
@@ -1047,6 +1259,7 @@ def build_interactive_card(
                 field=f"input {input_id} label",
                 max_chars=_MAX_INTERACTIVE_LABEL_CHARS,
             )
+        choice_titles: list[str] = []
         if kind == "choice":
             raw_choices = raw_input.get("choices")
             if (
@@ -1060,7 +1273,7 @@ def build_interactive_card(
                 raise ValueError(f"choice input {input_id} requires choices")
             choices: list[dict[str, str]] = []
             choice_values: set[str] = set()
-            choice_titles: list[str] = []
+            choice_titles = []
             for raw_choice in raw_choices[:128]:
                 if not isinstance(raw_choice, Mapping):
                     raise ValueError("interactive card choices must be objects")
@@ -1174,7 +1387,7 @@ def build_interactive_card(
 
 _REASONING_TEMPLATE_ID = "ai.reasoning-process"
 _REASONING_TEMPLATE_WIRE = "template-ref/v1"
-_REASONING_FALLBACK_THOUGHT = "Thinking through…"
+_REASONING_FALLBACK_THOUGHT = "正在分析…"
 _REASONING_THOUGHT_MAX = 280
 _REASONING_TOOL_NAME_MAX = 80
 _REASONING_MAX_PHASES = 6
@@ -1336,20 +1549,27 @@ def summarize_tool_result(tool_name: str | None, result: object) -> str:
     if result is None:
         return ""
     if isinstance(result, list):
-        return f"{len(result)} results"
+        return f"{len(result)} 项结果"
     if not isinstance(result, Mapping):
-        return "completed"
+        return "已完成"
     records: list[Mapping[str, object]] = [result]
     for key in ("details", "meta", "metadata", "summary"):
         value = result.get(key)
         if isinstance(value, Mapping):
             records.append(value)
-    if tool_name in {"exec", "bash", "shell", "process"}:
+    if tool_name in {
+        "exec",
+        "exec_command",
+        "bash",
+        "shell",
+        "process",
+        "terminal",
+    }:
         for record in records:
             for key in ("exitCode", "exit_code", "code"):
                 count = _finite_count(record.get(key))
                 if count is not None:
-                    return f"exit {count}"
+                    return f"退出码 {count}"
     for record in records:
         for key in (
             "matchCount",
@@ -1361,33 +1581,48 @@ def summarize_tool_result(tool_name: str | None, result: object) -> str:
         ):
             count = _finite_count(record.get(key))
             if count is not None:
-                return f"{count} results"
+                return f"{count} 项结果"
     for record in records:
         for key in ("fileCount", "file_count", "changedFiles"):
             count = _finite_count(record.get(key))
             if count is not None:
-                return f"{count} files"
+                return f"{count} 个文件"
         for key in ("bytes", "byteLength", "writtenBytes"):
             count = _finite_count(record.get(key))
             if count is not None:
-                return f"{count} bytes"
+                return f"{count} 字节"
+    status_labels = {
+        "accepted": "已接受",
+        "queued": "排队中",
+        "waiting": "等待中",
+        "completed": "已完成",
+        "complete": "已完成",
+        "success": "已完成",
+        "succeeded": "已完成",
+        "ok": "已完成",
+        "done": "已完成",
+    }
     for record in records:
         status = record.get("status")
-        if not isinstance(status, str):
-            continue
-        normalized = status.lower()
-        if normalized in {"accepted", "queued", "waiting"}:
-            return normalized
-        if normalized in {
-            "completed",
-            "complete",
-            "success",
-            "succeeded",
-            "ok",
-            "done",
-        }:
-            return "completed"
-    return "completed"
+        if isinstance(status, str):
+            label = status_labels.get(status.lower())
+            if label is not None:
+                return label
+    return "已完成"
+
+
+def localize_result_summary(summary: str) -> str | None:
+    """Normalize common bounded result summaries into Chinese."""
+    clean = sanitize_visible_text(summary)
+    if not clean:
+        return None
+    lowered = clean.lower()
+    if lowered in {"complete", "completed", "done", "success", "succeeded"}:
+        return "已完成"
+    match = re.fullmatch(r"(\d+)\s+(?:results?|items?)", lowered)
+    if match is not None:
+        return f"{match.group(1)} 项结果"
+    return clean
 
 
 def _reasoning_status(tool: Mapping[str, object]) -> str:
@@ -1397,29 +1632,26 @@ def _reasoning_status(tool: Mapping[str, object]) -> str:
     return _REASONING_STATUS_MAP[status]
 
 
-def _reasoning_tool_name(tool_name: object) -> str:
-    if tool_name == "__thinking__":
-        return "think"
-    if tool_name == "__subagent_wait__":
-        return "wait"
-    if not isinstance(tool_name, str):
-        return "tool"
-    try:
-        reduced = re.sub(r"\s+", " ", reduce_urls_in_text(tool_name)).strip()
-    except CardLimitError:
-        return "tool"
-    if not reduced or is_sensitive(reduced, generic=True):
-        return "tool"
-    if len(reduced) > _REASONING_TOOL_NAME_MAX:
-        return f"{reduced[:_REASONING_TOOL_NAME_MAX]}…"
-    return reduced
+def _reasoning_tool_name(tool: Mapping[str, object]) -> str:
+    raw_label = tool.get("label")
+    if isinstance(raw_label, str):
+        try:
+            clean = sanitize_visible_text(raw_label)
+        except CardLimitError:
+            clean = None
+        if clean:
+            if len(clean) > _REASONING_TOOL_NAME_MAX:
+                return f"{clean[:_REASONING_TOOL_NAME_MAX]}…"
+            return clean
+    raw_name = tool.get("tool_name")
+    return localized_tool_label(raw_name if isinstance(raw_name, str) else None)
 
 
 def _reasoning_action(tool: Mapping[str, object]) -> dict[str, str]:
     status = _reasoning_status(tool)
     tool_name = tool.get("tool_name")
     if tool_name == "__subagent_wait__":
-        label = "Waiting for subtask…" if status == "running" else "Subtask returned"
+        label = "正在等待子任务…" if status == "running" else "子任务已返回"
         duration = format_progress_duration(tool.get("duration_ms"))
         detail = f"{label} · {duration}" if duration else label
     else:
@@ -1431,7 +1663,7 @@ def _reasoning_action(tool: Mapping[str, object]) -> dict[str, str]:
         )
         result_summary = tool.get("result_summary")
         safe_result = (
-            sanitize_visible_text(result_summary)
+            localize_result_summary(result_summary)
             if isinstance(result_summary, str)
             else None
         )
@@ -1447,15 +1679,17 @@ def _reasoning_action(tool: Mapping[str, object]) -> dict[str, str]:
         if parts:
             detail = " · ".join(parts)
         elif status == "running":
-            detail = "Running…"
+            detail = "进行中"
         elif status == "error":
-            detail = "Call failed"
+            detail = "调用失败"
         else:
-            detail = "Completed"
+            detail = "已完成"
     return {
-        "tool": _reasoning_tool_name(tool_name),
+        "tool": _reasoning_tool_name(tool),
         "detail": detail,
-        "statusGlyph": "●",
+        "statusGlyph": (
+            "◉" if status == "running" else "○" if status == "error" else "●"
+        ),
         "statusTone": (
             "Accent"
             if status == "running"
@@ -1507,11 +1741,11 @@ def _reasoning_phases(
         thinking = thinking_steps[index] if index < len(thinking_steps) else None
         status = _reasoning_status(thinking) if thinking is not None else "done"
         detail = (
-            "Planning next step…"
+            "正在规划下一步…"
             if status == "running"
-            else "Phase stopped"
+            else "该阶段已停止"
             if status == "error"
-            else "Phase complete"
+            else "该阶段已完成"
         )
         duration = (
             format_progress_duration(thinking.get("duration_ms"))
@@ -1519,9 +1753,11 @@ def _reasoning_phases(
             else ""
         )
         actions.append({
-            "tool": "think",
+            "tool": "分析问题",
             "detail": f"{detail} · {duration}" if duration else detail,
-            "statusGlyph": "●",
+            "statusGlyph": (
+                "◉" if status == "running" else "○" if status == "error" else "●"
+            ),
             "statusTone": (
                 "Accent"
                 if status == "running"
@@ -1570,28 +1806,28 @@ def _reasoning_process_data(
         for tool in tools
     )
     phase_count = len(phases)
-    phase_label = f"{phase_count} {'phase' if phase_count == 1 else 'phases'}"
-    tool_label = f"{tool_count} {'tool call' if tool_count == 1 else 'tool calls'}"
+    phase_label = f"{phase_count} 个阶段"
+    tool_label = f"{tool_count} 次工具调用"
     active = state in {"reasoning", "answering"}
     error_message = (
-        "Timed out waiting for the background task."
+        "等待后台任务超时。"
         if phase == "expired"
-        else "Reasoning was interrupted. Completed steps were preserved."
+        else "处理被中断，已完成的步骤仍然保留。"
     )
     data: dict[str, object] = {
         "reasoningId": reasoning_id.strip() or "octo-progress",
         "state": state,
-        "title": "Reasoning",
+        "title": "处理进度",
         "statusLabel": (
-            "Thinking"
+            "进行中"
             if state == "reasoning"
-            else "Answering"
+            else "正在整理答案"
             if state == "answering"
-            else "Done"
+            else "已完成"
             if state == "completed"
-            else "Stopped"
+            else "已停止"
             if state == "stopped"
-            else "Failed"
+            else "处理失败"
         ),
         "statusTone": (
             "Accent"
@@ -1603,43 +1839,43 @@ def _reasoning_process_data(
             else "Attention"
         ),
         "timerText": (
-            "Reasoning…"
+            "正在处理…"
             if state == "reasoning"
-            else "Writing the answer…"
+            else "正在整理答案…"
             if state == "answering"
-            else f"{elapsed} · stopped at phase {phase_count}"
+            else f"{elapsed} · 已保留 {phase_label}"
             if state == "stopped"
-            else "Interrupted"
+            else "处理被中断"
             if state == "error"
             else f"{elapsed} · {phase_label} · {tool_label}"
         ),
         "traceExpanded": active or state == "error",
         "traceCollapsed": not active and state != "error",
         "collapsedSummary": (
-            "Reasoning complete · answer in progress"
+            "分析已完成，正在整理答案"
             if state == "answering"
-            else f"Kept {phase_label} from before the stop"
+            else f"已保留停止前的 {phase_label}"
             if state == "stopped"
-            else "Interrupted · open to see the steps so far"
+            else "处理被中断，可展开查看已完成的步骤"
             if state == "error"
-            else f"{elapsed} · trace collapsed"
+            else f"{elapsed} · 执行详情已收起"
             if state == "completed"
-            else "Reasoning in progress · open to follow along"
+            else "正在处理，可展开查看执行详情"
         ),
         "phases": phases,
     }
     if state == "reasoning":
         data["progressText"] = (
-            "Waiting for subtask…"
+            "正在等待子任务…"
             if phase == "paused"
-            else "Subtask returned. Wrapping up…"
+            else "子任务已返回，正在收尾…"
             if phase == "resuming"
-            else "Working through…"
+            else "正在处理…"
         )
     elif state == "answering":
-        data["progressText"] = "Reasoning complete. Writing the answer…"
+        data["progressText"] = "分析已完成，正在整理答案…"
     elif state == "error":
-        data["errorTitle"] = "Generation failed"
+        data["errorTitle"] = "处理未完成"
         data["errorMessage"] = error_message
     return data
 
@@ -1701,7 +1937,10 @@ def _reasoning_action_row(
     action: Mapping[str, object],
     *,
     first: bool,
+    last: bool,
 ) -> dict[str, object]:
+    glyph = str(action["statusGlyph"])
+    rail = glyph if last else f"{glyph}\n│"
     return {
         "type": "ColumnSet",
         "spacing": "None" if first else "Small",
@@ -1711,20 +1950,8 @@ def _reasoning_action_row(
                 "width": "auto",
                 "items": [
                     _reasoning_text_block(
-                        str(action["statusGlyph"]),
+                        rail,
                         color=str(action["statusTone"]),
-                        size="Small",
-                        spacing="None",
-                    )
-                ],
-            },
-            {
-                "type": "Column",
-                "width": "auto",
-                "items": [
-                    _reasoning_text_block(
-                        str(action["tool"]),
-                        weight="Bolder",
                         size="Small",
                         spacing="None",
                     )
@@ -1735,11 +1962,18 @@ def _reasoning_action_row(
                 "width": "stretch",
                 "items": [
                     _reasoning_text_block(
+                        str(action["tool"]),
+                        weight="Bolder",
+                        size="Small",
+                        spacing="None",
+                    ),
+                    _reasoning_text_block(
                         str(action["detail"]),
                         isSubtle=True,
                         size="Small",
                         spacing="None",
-                    )
+                        fontType="Monospace",
+                    ),
                 ],
             },
         ],
@@ -1765,10 +1999,13 @@ def _reasoning_phase_block(
             ),
             {
                 "type": "Container",
-                "style": "emphasis",
                 "spacing": "Small",
                 "items": [
-                    _reasoning_action_row(action, first=index == 0)
+                    _reasoning_action_row(
+                        action,
+                        first=index == 0,
+                        last=index == len(raw_actions) - 1,
+                    )
                     for index, action in enumerate(raw_actions)
                     if isinstance(action, Mapping)
                 ],
@@ -1822,8 +2059,8 @@ def build_reasoning_process_card(
     body: list[dict[str, object]] = [
         {
             "type": "Container",
-            "id": "octo-surface-accent-header-reasoning-active",
-            "style": "accent",
+            "id": "octo-execution-trace-header",
+            "style": "emphasis",
             "bleed": True,
             "spacing": "None",
             "items": [
@@ -1836,8 +2073,7 @@ def build_reasoning_process_card(
                             "width": "stretch",
                             "items": [
                                 _reasoning_text_block(
-                                    f"✦  {data['title']}",
-                                    color="Accent",
+                                    str(data["title"]),
                                     weight="Bolder",
                                     spacing="None",
                                 ),
@@ -1879,7 +2115,7 @@ def build_reasoning_process_card(
                 *(
                     [
                         _reasoning_text_block(
-                            f"◌  {data['progressText']}",
+                            f"◉  {data['progressText']}",
                             color="Accent",
                             size="Small",
                             spacing="Large",
@@ -1896,7 +2132,7 @@ def build_reasoning_process_card(
                             "spacing": "Large",
                             "items": [
                                 _reasoning_text_block(
-                                    str(data.get("errorTitle", "Generation failed")),
+                                    str(data.get("errorTitle", "处理未完成")),
                                     weight="Bolder",
                                     color="Attention",
                                     spacing="None",
@@ -1921,7 +2157,8 @@ def build_reasoning_process_card(
             "spacing": "Medium",
             "items": [
                 _reasoning_text_block(
-                    f"✓  {data['collapsedSummary']}",
+                    f"●  {data['collapsedSummary']}",
+                    color=str(data["statusTone"]),
                     size="Small",
                     isSubtle=True,
                     spacing="None",
@@ -1944,7 +2181,7 @@ def build_reasoning_process_card(
                         {
                             "type": "Action.ToggleVisibility",
                             "id": "reasoning_toggle",
-                            "title": "Show / hide reasoning",
+                            "title": "展开/收起执行详情",
                             "targetElements": [
                                 "trace_panel",
                                 "collapsed_panel",
@@ -1954,7 +2191,7 @@ def build_reasoning_process_card(
                 }
             ],
         })
-    plain_lines = [f"{data['statusLabel']} · {data['timerText']}"]
+    plain_lines = [f"{data['title']} · {data['statusLabel']} · {data['timerText']}"]
     for item in phases:
         plain_lines.append(str(item["thought"]))
         actions = item["actions"]
@@ -1987,58 +2224,190 @@ def build_reasoning_process_card(
     return result
 
 
-_PROGRESS_TITLES = {
-    "starting": "Working",
-    "running": "Working",
-    "completed": "Completed",
-    "failed": "Stopped",
-}
+_PROGRESS_PHASES = frozenset({
+    "thinking", "tool", "answering", "completed", "stopped", "failed", "expired",
+    "starting", "running",
+})
 _PROGRESS_STATUSES = frozenset({"running", "complete", "failed"})
+_PROGRESS_MAX_VISIBLE_STEPS = 12
+
+
+def _progress_state(phase: str) -> tuple[str, str]:
+    if phase in {"starting", "thinking", "running", "tool"}:
+        return "进行中", "Accent"
+    if phase == "answering":
+        return "正在整理答案", "Accent"
+    if phase == "completed":
+        return "已完成", "Good"
+    if phase == "stopped":
+        return "已停止", "Warning"
+    return "处理失败", "Attention"
+
+
+def _progress_header(
+    phase: str,
+    tools: Sequence[Mapping[str, object]],
+    elapsed_ms: object,
+) -> str:
+    status_label, _tone = _progress_state(phase)
+    parts = ["处理进度", status_label]
+    if tools:
+        parts.append(f"{len(tools)} 个步骤")
+    elapsed = format_progress_duration(elapsed_ms)
+    if elapsed:
+        parts.append(elapsed)
+    return " · ".join(parts)
+
+
+def _progress_tool_label(tool: Mapping[str, object]) -> str:
+    raw_label = tool.get("label")
+    if isinstance(raw_label, str):
+        clean = sanitize_visible_text(raw_label)
+        if clean:
+            return clean
+    raw_name = tool.get("tool_name")
+    return localized_tool_label(raw_name if isinstance(raw_name, str) else None)
+
+
+def _progress_step(tool: Mapping[str, object]) -> dict[str, str]:
+    status = tool.get("status")
+    if status not in _PROGRESS_STATUSES:
+        raise ValueError("unsupported progress tool status")
+    label = _progress_tool_label(tool)
+    summary = tool.get("summary")
+    raw_name = tool.get("tool_name")
+    if isinstance(summary, str):
+        safe_summary = sanitize_visible_text(summary, generic=False)
+    else:
+        safe_summary = summarize_tool_params(
+            raw_name if isinstance(raw_name, str) else None,
+            tool.get("args"),
+        )
+    result = tool.get("result_summary")
+    safe_result = (
+        localize_result_summary(result) if isinstance(result, str) else None
+    )
+    duration = format_progress_duration(tool.get("duration_ms"))
+    if status == "running":
+        detail_parts = [part for part in (safe_summary, "进行中") if part]
+        glyph, tone = "◉", "Accent"
+    elif status == "failed":
+        error = sanitize_error_text(tool.get("error"))
+        detail_parts = [
+            part for part in (safe_summary, "失败", error, duration) if part
+        ]
+        glyph, tone = "○", "Attention"
+    else:
+        detail_parts = [
+            part
+            for part in (
+                safe_summary,
+                safe_result or "已完成",
+                duration,
+            )
+            if part
+        ]
+        glyph, tone = "●", "Good"
+    return {
+        "tool": label,
+        "detail": " · ".join(detail_parts),
+        "statusGlyph": glyph,
+        "statusTone": tone,
+    }
+
+
+def _progress_steps(
+    tools: Sequence[Mapping[str, object]],
+) -> list[dict[str, str]]:
+    steps: list[dict[str, str]] = []
+    index = 0
+    while index < len(tools):
+        current = tools[index]
+        if not isinstance(current, Mapping):
+            raise ValueError("progress tool entries must be objects")
+        name = current.get("tool_name")
+        if current.get("status") == "complete":
+            end = index + 1
+            while (
+                end < len(tools)
+                and isinstance(tools[end], Mapping)
+                and tools[end].get("tool_name") == name
+                and tools[end].get("status") == "complete"
+                and not tools[end].get("result_summary")
+                and not current.get("result_summary")
+            ):
+                end += 1
+            group = tools[index:end]
+            if len(group) > 1:
+                durations = [item.get("duration_ms") for item in group]
+                valid = [
+                    item
+                    for item in durations
+                    if isinstance(item, int)
+                    and not isinstance(item, bool)
+                    and item >= 0
+                ]
+                duration = (
+                    format_progress_duration(sum(valid)) if valid else ""
+                )
+                latest = group[-1].get("summary")
+                safe_latest = (
+                    sanitize_visible_text(latest, generic=False)
+                    if isinstance(latest, str)
+                    else None
+                )
+                detail_parts = []
+                if duration:
+                    detail_parts.append(f"总计 {duration}")
+                if safe_latest:
+                    detail_parts.append(f"最近：{safe_latest}")
+                steps.append({
+                    "tool": f"{_progress_tool_label(current)} × {len(group)}",
+                    "detail": " · ".join(detail_parts) or "已完成",
+                    "statusGlyph": "●",
+                    "statusTone": "Good",
+                })
+                index = end
+                continue
+        steps.append(_progress_step(current))
+        index += 1
+    return steps
+
+
+def _progress_plain_line(step: Mapping[str, str]) -> str:
+    detail = step.get("detail")
+    suffix = f" · {detail}" if detail else ""
+    return f"{step['statusGlyph']} {step['tool']}{suffix}"
 
 
 def build_progress_card(
     *,
     phase: str,
     tools: Sequence[Mapping[str, object]] = (),
+    elapsed_ms: object = None,
     capabilities: CardCapabilities | None = None,
 ) -> CardRenderResult:
-    """Render lifecycle state without exposing prompts, reasoning, or raw output."""
-    title = _PROGRESS_TITLES.get(phase)
-    if title is None:
+    """Render a Chinese execution trace without exposing reasoning text."""
+    if phase not in _PROGRESS_PHASES:
         raise ValueError("unsupported progress card phase")
-    if len(tools) > 32:
-        raise CardLimitError("progress card exceeds tool entry limit")
-    blocks: list[dict[str, str]] = []
-    for tool in tools:
-        if not isinstance(tool, Mapping):
-            raise ValueError("progress tool entries must be objects")
-        status = tool.get("status")
-        if status not in _PROGRESS_STATUSES:
-            raise ValueError("unsupported progress tool status")
-        raw_tool_name = tool.get("tool_name")
-        label = safe_tool_label(
-            raw_tool_name if isinstance(raw_tool_name, str) else None
-        )
-        raw_summary = tool.get("summary")
-        if isinstance(raw_summary, str):
-            clean_summary = sanitize_visible_text(raw_summary)
-            summary = clean_summary[:_SUMMARY_MAX_CHARS] if clean_summary else ""
-        else:
-            summary = summarize_tool_params(label, tool.get("args"))
-        line = f"{label}{f' ({summary})' if summary else ''}: {status}"
-        if status == "failed":
-            safe_error = sanitize_error_text(tool.get("error"))
-            if safe_error:
-                line = f"{line} - {safe_error}"
-        blocks.append({"type": "text", "text": line})
-    if not blocks:
-        blocks.append({
-            "type": "text",
-            "text": "Preparing" if phase == "starting" else title,
-        })
+    real_tools = [
+        tool
+        for tool in tools
+        if isinstance(tool, Mapping) and tool.get("tool_name") != "__thinking__"
+    ]
+    hidden = max(0, len(real_tools) - _PROGRESS_MAX_VISIBLE_STEPS)
+    visible = list(real_tools[-_PROGRESS_MAX_VISIBLE_STEPS:])
+    steps = _progress_steps(visible)
+    detail_lines = (
+        [f"已隐藏前 {hidden} 个步骤"] if hidden else []
+    ) + [_progress_plain_line(step) for step in steps]
+    if not detail_lines:
+        detail_lines = ["正在准备"]
+    header = _progress_header(phase, real_tools, elapsed_ms)
+    plain = "\n".join([header, *detail_lines])
     flat = build_display_card(
-        title=title,
-        blocks=blocks,
+        title=header,
+        blocks=[{"type": "text", "text": line} for line in detail_lines],
         capabilities=capabilities,
     )
     if (
@@ -2046,36 +2415,176 @@ def build_progress_card(
         or not _supports(capabilities.elements, "ColumnSet")
         or not _supports(capabilities.elements, "Container")
     ):
-        return flat
-    detail = build_display_card(
-        blocks=blocks,
-        capabilities=capabilities,
+        return CardRenderResult(card=flat.card, plain=plain)
+    can_toggle = (
+        _supports(capabilities.elements, "ActionSet")
+        and capabilities.actions is not None
+        and "Action.ToggleVisibility" in capabilities.actions
     )
+    terminal = phase in {"completed", "stopped", "failed", "expired"}
+    detail_visible = not (can_toggle and terminal)
+    status_label, status_tone = _progress_state(phase)
+    summary_parts = []
+    if real_tools:
+        complete_count = sum(
+            tool.get("status") == "complete" for tool in real_tools
+        )
+        if terminal:
+            summary_parts.append(f"{len(real_tools)} 个步骤")
+        else:
+            summary_parts.append(
+                f"已完成 {complete_count}/{len(real_tools)} 个步骤"
+            )
+    elapsed = format_progress_duration(elapsed_ms)
+    if elapsed:
+        summary_parts.append(elapsed)
+    summary_text = " · ".join(summary_parts) or "正在准备"
+    status_items: list[dict[str, object]] = [
+        _reasoning_text_block(
+            status_label,
+            color=status_tone,
+            weight="Bolder",
+            size="Small",
+            spacing="None",
+        )
+    ]
+    header_columns: list[dict[str, object]] = [
+        {
+            "type": "Column",
+            "width": "stretch",
+            "items": [
+                _reasoning_text_block(
+                    "处理进度",
+                    weight="Bolder",
+                    spacing="None",
+                ),
+                _reasoning_text_block(
+                    summary_text,
+                    size="Small",
+                    isSubtle=True,
+                    spacing="Small",
+                ),
+            ],
+        },
+        {
+            "type": "Column",
+            "width": "auto",
+            "items": status_items,
+        },
+    ]
+    if can_toggle:
+        status_items.extend([
+            {
+                "type": "ActionSet",
+                "id": "btn_collapse",
+                "isVisible": detail_visible,
+                "actions": [{
+                    "type": "Action.ToggleVisibility",
+                    "title": "收起执行详情",
+                    "targetElements": [
+                        {"elementId": "timeline_detail", "isVisible": False},
+                        {"elementId": "btn_collapse", "isVisible": False},
+                        {"elementId": "btn_expand", "isVisible": True},
+                    ],
+                }],
+            },
+            {
+                "type": "ActionSet",
+                "id": "btn_expand",
+                "isVisible": not detail_visible,
+                "actions": [{
+                    "type": "Action.ToggleVisibility",
+                    "title": "展开执行详情",
+                    "targetElements": [
+                        {"elementId": "timeline_detail", "isVisible": True},
+                        {"elementId": "btn_collapse", "isVisible": True},
+                        {"elementId": "btn_expand", "isVisible": False},
+                    ],
+                }],
+            },
+        ])
+    trace_items: list[dict[str, object]] = []
+    if hidden:
+        trace_items.append(
+            _reasoning_text_block(
+                f"已隐藏前 {hidden} 个步骤",
+                isSubtle=True,
+                size="Small",
+                spacing="None",
+            )
+        )
+    trace_items.extend(
+        _reasoning_action_row(
+            step,
+            first=index == 0 and not hidden,
+            last=index == len(steps) - 1,
+        )
+        for index, step in enumerate(steps)
+    )
+    if not trace_items:
+        trace_items.append(
+            _reasoning_text_block(
+                "正在准备",
+                isSubtle=True,
+                size="Small",
+                spacing="None",
+            )
+        )
     card: dict[str, Any] = {
         "$schema": ADAPTIVE_CARD_SCHEMA,
         "type": "AdaptiveCard",
         "version": CARD_VERSION,
         "body": [
             {
-                "type": "ColumnSet",
-                "columns": [
-                    {
-                        "type": "Column",
-                        "width": "stretch",
-                        "items": [_text_element(title, bold=True)],
-                    }
-                ],
+                "type": "Container",
+                "id": "octo-execution-trace-header",
+                "style": "emphasis",
+                "bleed": True,
+                "spacing": "None",
+                "items": [{
+                    "type": "ColumnSet",
+                    "spacing": "None",
+                    "columns": header_columns,
+                }],
             },
             {
                 "type": "Container",
-                "id": "octo_progress_details",
-                "items": detail.card["body"],
+                "id": "timeline_detail",
+                "isVisible": detail_visible,
+                "spacing": "Medium",
+                "items": trace_items,
             },
         ],
         "metadata": {"octo_layout": "agent_progress_v1"},
     }
     try:
-        validate_card_limits(card, flat.plain, capabilities)
+        validate_card_limits(card, plain, capabilities)
     except CardLimitError:
-        return flat
-    return CardRenderResult(card=card, plain=flat.plain)
+        return CardRenderResult(card=flat.card, plain=plain)
+    return CardRenderResult(card=card, plain=plain)
+
+
+def build_agent_progress_card(
+    *,
+    phase: str,
+    tools: Sequence[Mapping[str, object]],
+    elapsed_ms: object = None,
+    reasoning_id: str = "",
+    reasoning_visible: bool,
+    capabilities: CardCapabilities | None = None,
+) -> CardRenderResult:
+    """Select reasoning or fallback progress independently of delivery mode."""
+    has_public_thought = any(
+        tool.get("tool_name") == "__thinking__"
+        and isinstance(tool.get("thought"), str)
+        and bool(str(tool.get("thought")).strip())
+        for tool in tools
+    )
+    if reasoning_visible and has_public_thought:
+        return build_reasoning_process_card(
+            phase=phase, tools=tools, elapsed_ms=elapsed_ms,
+            reasoning_id=reasoning_id, capabilities=capabilities,
+        )
+    return build_progress_card(
+        phase=phase, tools=tools, elapsed_ms=elapsed_ms, capabilities=capabilities,
+    )

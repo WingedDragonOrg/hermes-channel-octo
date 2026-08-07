@@ -43,7 +43,7 @@
 |---|---|---|---|
 | Bot 注册、ECDH/AES、WuKongIM WS | DONE | `adapter.py`, `protocol.py` | 连接日志与收发回归通过 |
 | WS / HTTP 双心跳 | DONE | `tests/test_heartbeat.py` | 独立周期、错误退避、404 disable |
-| 重连、取消安全、资源所有权 | DONE | `tests/test_reconnect.py`, `tests/test_streaming.py` | 无 session/task/watchdog 泄漏 |
+| 重连、取消安全、资源所有权 | DONE | `tests/test_reconnect.py`, `tests/test_streaming.py` | 无 session/task 泄漏；文本回复不创建编辑 watchdog |
 | 可信 requester 身份 | DONE | `agent_tools.py`, `permission.py` | `requester_uid` 必须匹配 ContextVar |
 | `on_behalf_of` persona 身份 | VERIFY-LIVE | `OCTO_ON_BEHALF_OF` 只从 adapter 配置读取；text/typing/RichText/media/普通 edit 全链路透传，Type-17/progress 在该模式安全降级为纯文本；待实服授权核对 grant |
 | DM / Group / Thread / Space 会话隔离 | DONE | `tests/test_context_isolation.py` | 无缓存、历史、成员跨域污染 |
@@ -69,14 +69,15 @@
 | 能力 | 状态 | 当前证据 | 缺口 |
 |---|---|---|---|
 | Text 发送 | DONE | `api.send_message()` | 无 |
-| server-backed streaming | DONE | send + edit + finalize | 无 |
-| 普通消息 edit | DONE | `api.edit_message()` | 无 |
+| Hermes 完整文本回复 | DONE | `SUPPORTS_MESSAGE_EDITING=False` + `api.send_message()`；`tests/test_streaming.py` | Hermes 在 turn 完成后发送一条权威正文，避免首 token 碎片被误判为终答 |
+| server-backed text streaming / 普通消息 edit | BLOCKED-UPSTREAM | 实服 `/v1/bot/stream/start` 返回 404；`message/edit` 可写 `content_edit` 但不是可靠的客户端可见文本流 | 不用于 Hermes 回复；服务端与客户端提供明确、可验收的 Bot streaming 合同后再启用 |
 | 图片、文件、语音、视频 | VERIFY-LIVE | adapter `send_*` + backend-agnostic presigned upload；当前会话媒体工具 | 与 OpenClaw 一致支持本地路径、`file://`、HTTP(S)，native adapter 支持 `data:`；按 server 100 MiB 上限上传；保留并重放服务端 `uploadUrl` / `downloadUrl` / signed headers；待实服上传 |
 | RichText(14) | VERIFY-LIVE | `api.send_rich_text_message()` + `octo_send_rich_text` | 受控 text/image blocks 与 authoritative plain 已覆盖；待实服发送 |
 | InteractiveCard(17) send | VERIFY-LIVE | `api.send_card_message()`、安全 renderer、当前会话工具 | Type-17 envelope/profile/identity 自动化已覆盖；待实服发送 |
 | InteractiveCard(17) edit | VERIFY-LIVE | `api.edit_card_message()`、progress、session-bound `octo_edit_card` | 完整 frame、`card_seq`、`transient`、终态自动化已覆盖；待实服编辑 |
 | card profile manifest | VERIFY-LIVE | `api.get_card_profile()` + adapter-local 60s cache | 404/disabled 区分、bot-scoped cache、legacy opt-in fallback 已覆盖；待实服 manifest |
-| template-ref/v1 | MISSING | manifest 字段可解析，未提供发送面 | 第二阶段，须先核验服务端 manifest/templates |
+| template-ref/v1 | VERIFY-LIVE | `api.send_template_card_message()` / `edit_template_card_message()`；`OCTO_PROGRESS_CARD_RENDERER=registry` 显式启用，manifest 不兼容时回退本地 Type-17 | 自动化覆盖 Registry 首发、编辑、终态、失败恢复；待实服模板验收 |
+| 工具进度卡 | VERIFY-LIVE | 默认 `local`：中文 Type-17 执行轨迹、工具参数/结果安全摘要、耗时、运行/成功/失败状态、终态折叠；仅首次真实工具调用时创建 | 不展示 hidden CoT；待 xiao_ai 实服客户端视觉与逐步更新验收 |
 | on-behalf-of Type-17 | BLOCKED-UPSTREAM | 参考实现说明 server 拒绝 | 不绕过；普通 bot 发卡不允许模型伪造身份 |
 
 ### 3.4 管理工具面
@@ -168,7 +169,7 @@ POST /v1/bot/events/{event_id}/ack
 - 每个 turn 只保留最近 32 条工具摘要，避免长任务无限增长；
 - secret-shape、token、password、authorization、签名 URL 命中即整段隐藏；
 - 首帧发送卡，后续用 transient edit，完成/错误/中断写 final frame；
-- card 不取代最终答案，最终答案仍走 Hermes 正常文本 streaming；
+- card 不取代最终答案，最终答案由 Hermes 缓冲完成后通过普通 Text 消息一次发送；
 - capability 不支持时 fail-soft：回退现有文字进度或静默，绝不阻断答案。
 
 #### 插件内集成方案

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import threading
@@ -31,10 +32,14 @@ _CARD_AUTHORING_TOOLS = frozenset({
 
 
 
+_ProgressKey = tuple[str, str, int]
+
+
 @dataclass
 class _ProgressTool:
     tool_call_id: str
     tool_name: str
+    label: str
     summary: str
     status: str = "running"
     error: str = ""
@@ -50,6 +55,7 @@ class _ProgressTurn:
     route: TrustedOctoRoute
     session_id: str
     turn_id: str
+    segment_no: int
     tools: OrderedDict[str, _ProgressTool] = field(default_factory=OrderedDict)
     fallback_ids: dict[str, list[str]] = field(default_factory=dict)
     revision: int = 0
@@ -57,6 +63,7 @@ class _ProgressTurn:
     message_id: str | None = None
     card_seq: int = 0
     scheduled: bool = False
+    send_started: bool = False
     final: bool = False
     final_phase: str = "completed"
     phase: str = "thinking"
@@ -71,7 +78,7 @@ class CardProgressController:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._states: dict[tuple[str, str], _ProgressTurn] = {}
+        self._states: dict[_ProgressKey, _ProgressTurn] = {}
 
     @property
     def state_count(self) -> int:
@@ -88,13 +95,22 @@ class CardProgressController:
     ) -> None:
         if not session_id or not turn_id or adapter.on_behalf_of is not None:
             return
-        key = (session_id, turn_id)
         with self._lock:
+            matching = [
+                key
+                for key in self._states
+                if key[0] == session_id and key[1] == turn_id
+            ]
+            if any(not self._states[key].final for key in matching):
+                return
+            segment_no = max((key[2] for key in matching), default=-1) + 1
+            key = (session_id, turn_id, segment_no)
             self._states[key] = _ProgressTurn(
                 adapter=adapter,
                 route=route,
                 session_id=session_id,
                 turn_id=turn_id,
+                segment_no=segment_no,
             )
             self._schedule_locked(key)
 
@@ -117,6 +133,7 @@ class CardProgressController:
                 tool_call_id=step_id,
                 tool_name="__thinking__",
                 summary="",
+                label=cards.localized_tool_label("__thinking__"),
             )
             state.phase = "thinking"
             state.revision += 1
@@ -201,17 +218,19 @@ class CardProgressController:
                         state.tools.pop(step_id, None)
                 state.revision += 1
                 return
-            label = cards.safe_tool_label(tool_name)
+            key_label = cards.safe_tool_label(tool_name)
+            display_label = cards.localized_tool_label(tool_name, args)
             summary = cards.summarize_tool_params(tool_name, args)
-            call_id = tool_call_id or f"{label}:{len(state.tools) + 1}"
+            call_id = tool_call_id or f"{key_label}:{len(state.tools) + 1}"
             state.tools[call_id] = _ProgressTool(
                 tool_call_id=call_id,
-                tool_name=tool_name or label,
+                tool_name=tool_name or key_label,
                 summary=summary,
+                label=display_label,
             )
             state.phase = "tool"
             if not tool_call_id:
-                state.fallback_ids.setdefault(label, []).append(call_id)
+                state.fallback_ids.setdefault(key_label, []).append(call_id)
             state.revision += 1
             self._schedule_locked(key)
 
@@ -238,7 +257,7 @@ class CardProgressController:
                 label = cards.safe_tool_label(tool_name)
                 pending = state.fallback_ids.get(label)
                 if pending:
-                    call_id = pending.pop(0)
+                    call_id = pending.pop()
                     if not pending:
                         state.fallback_ids.pop(label, None)
             tool = state.tools.get(call_id)
@@ -277,6 +296,7 @@ class CardProgressController:
         session_id: str,
         turn_id: str,
         failed: bool = False,
+        terminal_phase: str | None = None,
     ) -> None:
         with self._lock:
             key = self._find_key_locked(session_id, turn_id)
@@ -285,18 +305,72 @@ class CardProgressController:
                 return
             assert key is not None
             state.final = True
-            state.final_phase = "failed" if failed else "completed"
+            state.final_phase = terminal_phase or ("stopped" if failed else "completed")
             state.phase = state.final_phase
             now = time.monotonic()
             for tool in state.tools.values():
                 if tool.status == "running":
-                    tool.status = "failed" if failed else "complete"
+                    tool.status = "failed" if failed or state.final_phase != "completed" else "complete"
                     tool.duration_ms = max(
                         0,
                         int((now - tool.started_at) * 1_000),
                     )
             state.revision += 1
             self._schedule_locked(key)
+
+    def rollover_for_inbound(
+        self,
+        *,
+        chat_id: str,
+        requester_uid: str,
+    ) -> None:
+        """Stop the visible segment so the next tool starts a card at the bottom."""
+        if not chat_id or not requester_uid:
+            return
+        with self._lock:
+            candidates = [
+                (key, state)
+                for key, state in self._states.items()
+                if not state.final
+                and state.route.chat_id == chat_id
+                and state.route.requester_uid == requester_uid
+            ]
+            if len(candidates) != 1:
+                return
+            old_key, state = candidates[0]
+            has_real_tool = any(
+                tool.tool_name != "__thinking__" for tool in state.tools.values()
+            )
+            if not has_real_tool and state.message_id is None:
+                return
+            next_segment = state.segment_no + 1
+            new_key = (state.session_id, state.turn_id, next_segment)
+            self._states[new_key] = _ProgressTurn(
+                adapter=state.adapter,
+                route=state.route,
+                session_id=state.session_id,
+                turn_id=state.turn_id,
+                segment_no=next_segment,
+                delivery_mode=state.delivery_mode,
+                template_ref=state.template_ref,
+                capabilities=state.capabilities,
+            )
+            if state.message_id is None and not state.send_started:
+                self._states.pop(old_key, None)
+                return
+            state.final = True
+            state.final_phase = "stopped"
+            state.phase = "stopped"
+            now = time.monotonic()
+            for tool in state.tools.values():
+                if tool.status == "running":
+                    tool.status = "failed"
+                    tool.duration_ms = max(
+                        0,
+                        int((now - tool.started_at) * 1_000),
+                    )
+            state.revision += 1
+            self._schedule_locked(old_key)
 
     def cancel_session(self, session_id: str) -> None:
         if not session_id:
@@ -320,18 +394,33 @@ class CardProgressController:
         self,
         session_id: str,
         turn_id: str,
-    ) -> tuple[str, str] | None:
+    ) -> _ProgressKey | None:
         if not session_id:
             return None
+        candidates = [
+            key
+            for key, state in self._states.items()
+            if key[0] == session_id and not state.final
+        ]
         if turn_id:
-            key = (session_id, turn_id)
-            return key if key in self._states else None
-        candidates = [key for key in self._states if key[0] == session_id]
-        return candidates[0] if len(candidates) == 1 else None
+            exact = [key for key in candidates if key[1] == turn_id]
+            if exact:
+                return max(exact, key=lambda key: key[2])
+        logical_turns = {(key[0], key[1]) for key in candidates}
+        if len(logical_turns) != 1:
+            return None
+        return max(candidates, key=lambda key: key[2], default=None)
 
-    def _schedule_locked(self, key: tuple[str, str]) -> None:
+    def _schedule_locked(self, key: _ProgressKey) -> None:
         state = self._states.get(key)
         if state is None or state.scheduled:
+            return
+        has_real_tool = any(
+            tool.tool_name != "__thinking__" for tool in state.tools.values()
+        )
+        if not has_real_tool:
+            if state.final:
+                self._states.pop(key, None)
             return
         state.scheduled = True
         try:
@@ -348,6 +437,7 @@ class CardProgressController:
             {
                 "tool_call_id": tool.tool_call_id,
                 "tool_name": tool.tool_name,
+                "label": tool.label,
                 "summary": tool.summary,
                 "status": tool.status,
                 "error": tool.error,
@@ -358,7 +448,7 @@ class CardProgressController:
             for tool in list(state.tools.values())[-_MAX_PROGRESS_TOOL_ENTRIES:]
         ]
 
-    async def _drain(self, key: tuple[str, str]) -> None:
+    async def _drain(self, key: _ProgressKey) -> None:
         while True:
             with self._lock:
                 state = self._states.get(key)
@@ -381,15 +471,21 @@ class CardProgressController:
                     0,
                     int((time.monotonic() - state.started_at) * 1_000),
                 )
-                reasoning_id = f"{state.session_id}:{state.turn_id}"
+                reasoning_id = (
+                    f"{state.session_id}:{state.turn_id}:{state.segment_no}"
+                )
             try:
                 if delivery_mode is None:
                     manifest = await _get_card_profile(
                         adapter,
                         adapter._http_session,
                     )
-                    selected = cards.select_reasoning_process_template(
-                        manifest.templating
+                    selected = (
+                        cards.select_reasoning_process_template(
+                            manifest.templating
+                        )
+                        if adapter.progress_card_renderer == "registry"
+                        else None
                     )
                     enabled = (
                         manifest.available and manifest.enabled
@@ -444,6 +540,11 @@ class CardProgressController:
                     return
 
                 if message_id is None:
+                    with self._lock:
+                        current = self._states.get(key)
+                        if current is None or current is not state:
+                            return
+                        current.send_started = True
                     if delivery_mode == "registry":
                         assert template_ref is not None
                         assert wire_data is not None
@@ -456,14 +557,17 @@ class CardProgressController:
                             template_ref=template_ref,
                             state=str(wire_data["state"]),
                             data=wire_data,
-                            client_msg_no=f"card-progress:{state.turn_id}"[:128],
+                            client_msg_no=(
+                                f"card-progress:{state.turn_id}:{state.segment_no}"
+                            )[:128],
                         )
                     else:
-                        rendered = cards.build_reasoning_process_card(
+                        rendered = cards.build_agent_progress_card(
                             phase=phase,
                             tools=tools,
                             elapsed_ms=elapsed_ms,
                             reasoning_id=reasoning_id,
+                            reasoning_visible=True,
                             capabilities=capabilities,
                         )
                         result = await api.send_card_message(
@@ -474,13 +578,16 @@ class CardProgressController:
                             channel_type=state.route.channel_type,
                             card=rendered.card,
                             plain=rendered.plain,
-                            client_msg_no=f"card-progress:{state.turn_id}"[:128],
+                            client_msg_no=(
+                                f"card-progress:{state.turn_id}:{state.segment_no}"
+                            )[:128],
                             profile=CARD_PROFILE_V1,
                         )
                     with self._lock:
                         current = self._states.get(key)
                         if current is None or current is not state:
                             return
+                        current.send_started = False
                         current.message_id = result.message_id
                         current.delivered_revision = revision
                         if current.revision == revision:
@@ -493,25 +600,43 @@ class CardProgressController:
                 if delivery_mode == "registry":
                     assert template_ref is not None
                     assert wire_data is not None
-                    await edit_template_card_message(
-                        adapter._http_session,
-                        adapter._api_url,
-                        adapter._bot_token,
-                        channel_id=state.route.channel_id,
-                        channel_type=state.route.channel_type,
-                        message_id=message_id,
-                        template_ref=template_ref,
-                        state=str(wire_data["state"]),
-                        data=wire_data,
-                        card_seq=next_seq,
-                        transient=not final,
-                    )
+                    delivered = False
+                    for attempt in range(3):
+                        try:
+                            await edit_template_card_message(
+                                adapter._http_session,
+                                adapter._api_url,
+                                adapter._bot_token,
+                                channel_id=state.route.channel_id,
+                                channel_type=state.route.channel_type,
+                                message_id=message_id,
+                                template_ref=template_ref,
+                                state=str(wire_data["state"]),
+                                data=wire_data,
+                                card_seq=next_seq,
+                                transient=not final,
+                            )
+                            delivered = True
+                            break
+                        except api.OctoApiError:
+                            if attempt < 2:
+                                await asyncio.sleep(0.1 * (2**attempt))
+                    if not delivered:
+                        logger.warning("[Octo] progress card edit retries exhausted")
+                        with self._lock:
+                            current = self._states.get(key)
+                            if current is not None and current is state:
+                                current.card_seq = next_seq
+                                current.delivered_revision = revision
+                                current.scheduled = False
+                        return
                 else:
-                    rendered = cards.build_reasoning_process_card(
+                    rendered = cards.build_agent_progress_card(
                         phase=phase,
                         tools=tools,
                         elapsed_ms=elapsed_ms,
                         reasoning_id=reasoning_id,
+                        reasoning_visible=True,
                         capabilities=capabilities,
                     )
                     await api.edit_card_message(
@@ -633,6 +758,14 @@ def _public_reasoning_summary(message: object) -> str:
     return cards.sanitize_reasoning_thought(joined) if joined else ""
 
 
+def on_octo_inbound_message(*, chat_id: str, requester_uid: str) -> None:
+    """Roll progress before Hermes' base adapter diverts a busy follow-up."""
+    _CONTROLLER.rollover_for_inbound(
+        chat_id=chat_id,
+        requester_uid=requester_uid,
+    )
+
+
 def _assistant_is_answering(message: object) -> bool:
     content = _message_field(message, "content")
     tool_calls = _message_field(message, "tool_calls")
@@ -729,14 +862,17 @@ def on_post_llm_call(**_kwargs: Any) -> None:
 def on_session_end(**kwargs: Any) -> None:
     session_id, turn_id = _turn_identity(kwargs)
     if session_id and turn_id:
+        if kwargs.get("completed"):
+            terminal_phase = "completed"
+        elif kwargs.get("interrupted"):
+            terminal_phase = "stopped"
+        else:
+            terminal_phase = "error"
         _CONTROLLER.complete(
             session_id=session_id,
             turn_id=turn_id,
-            failed=bool(
-                kwargs.get("failed")
-                or kwargs.get("interrupted")
-                or kwargs.get("completed") is False
-            ),
+            failed=terminal_phase != "completed",
+            terminal_phase=terminal_phase,
         )
     elif session_id:
         _CONTROLLER.cancel_session(session_id)

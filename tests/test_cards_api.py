@@ -246,16 +246,11 @@ class TestCardApi:
                 "message_id": "reasoning-1",
                 "channel_id": "group-1",
                 "channel_type": ChannelType.Group,
-                "content_edit": json.dumps(
-                    {
-                        "type": 17,
-                        "template_ref": template_ref,
-                        "state": "completed",
-                        "data": {**data, "state": "completed"},
-                        "card_seq": 2,
-                        "transient": False,
-                    }
-                ),
+                "template_ref": template_ref,
+                "state": "completed",
+                "data": {**data, "state": "completed"},
+                "card_seq": 2,
+                "transient": False,
             },
         )
 

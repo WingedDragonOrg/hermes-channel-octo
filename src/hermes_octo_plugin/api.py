@@ -735,21 +735,17 @@ async def edit_template_card_message(
     if isinstance(card_seq, bool) or not isinstance(card_seq, int) or card_seq <= 0:
         raise ValueError("card_seq must be a positive integer")
     _validate_template_frame(template_ref, state, data)
-    frame: dict[str, Any] = {
-        "type": MessageType.InteractiveCard,
+    body: dict[str, Any] = {
+        "message_id": message_id,
+        "channel_id": channel_id,
+        "channel_type": channel_type,
         "template_ref": dict(template_ref),
         "state": state,
         "data": data,
         "card_seq": card_seq,
     }
     if transient is not None:
-        frame["transient"] = transient
-    body: dict[str, Any] = {
-        "message_id": message_id,
-        "channel_id": channel_id,
-        "channel_type": channel_type,
-        "content_edit": json.dumps(frame),
-    }
+        body["transient"] = transient
     return await post_json(
         session,
         api_url,
@@ -882,6 +878,8 @@ async def edit_message(
     message_id: str,
     content: str,
     finalize: bool = False,
+    mention_uids: list[str] | None = None,
+    mention_entities: list[MentionEntity] | None = None,
     on_behalf_of: str | None = None,
 ) -> Any | None:
     """Edit a text message using Octo's native edit envelope.
@@ -891,11 +889,22 @@ async def edit_message(
     serialized.
     """
     del finalize
+    frame: dict[str, Any] = {"type": MessageType.Text, "content": content}
+    if mention_uids or mention_entities:
+        mention: dict[str, Any] = {}
+        if mention_uids:
+            mention["uids"] = mention_uids
+        if mention_entities:
+            mention["entities"] = [
+                {"uid": item.uid, "offset": item.offset, "length": item.length}
+                for item in mention_entities
+            ]
+        frame["mention"] = mention
     body: dict[str, Any] = {
         "message_id": str(message_id),
         "channel_id": channel_id,
         "channel_type": channel_type,
-        "content_edit": json.dumps({"type": MessageType.Text, "content": content}),
+        "content_edit": json.dumps(frame),
     }
     if on_behalf_of:
         body["on_behalf_of"] = on_behalf_of
