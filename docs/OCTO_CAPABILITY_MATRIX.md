@@ -78,6 +78,7 @@
 | card profile manifest | VERIFY-LIVE | `api.get_card_profile()` + adapter-local 60s cache | 404/disabled 区分、bot-scoped cache、legacy opt-in fallback 已覆盖；待实服 manifest |
 | template-ref/v1 | VERIFY-LIVE | `api.send_template_card_message()` / `edit_template_card_message()`；`OCTO_PROGRESS_CARD_RENDERER=registry` 显式启用，manifest 不兼容时回退本地 Type-17 | 自动化覆盖 Registry 首发、编辑、终态、失败恢复；待实服模板验收 |
 | 工具进度卡 | VERIFY-LIVE | 默认 `local`：中文 Type-17 执行轨迹、工具参数/结果安全摘要、耗时、运行/成功/失败状态、终态折叠；仅首次真实工具调用时创建 | 不展示 hidden CoT；待 xiao_ai 实服客户端视觉与逐步更新验收 |
+| Hermes `send_clarify` | VERIFY-LIVE | `>=0.20.0`：当前会话 Type-17 单选/多选/Other；低版本走 Hermes 文本 fallback | 运行时 PEP 440 版本门控、pending entry 对账、直接 `resolve_gateway_clarify` / `mark_awaiting_text`、重放与失败降级已有自动化覆盖；待实服交互 |
 | on-behalf-of Type-17 | BLOCKED-UPSTREAM | 参考实现说明 server 拒绝 | 不绕过；普通 bot 发卡不允许模型伪造身份 |
 
 ### 3.4 管理工具面
@@ -157,7 +158,7 @@ body: {"event_id": <cursor>, "limit": <n>, "wait": <seconds, optional>}
 POST /v1/bot/events/{event_id}/ack
 ```
 
-`card_action` 必须经过：envelope 校验 → message/session/channel 身份校验 → input id/大小/敏感信息校验 → 幂等 claim → 调度为同一 Octo 会话的新用户输入 → cursor 持久化 → ack。持久化必须先于 ack。
+`card_action` 必须经过：envelope 校验 → message/session/channel 身份校验 → input id/大小/敏感信息校验 → 幂等 claim → 按 card session 类型分发 → cursor 持久化 → ack。普通交互卡作为同一 Octo 会话的新用户输入；Hermes `>=0.20.0` clarify 卡直接调用 `resolve_gateway_clarify` 或 `mark_awaiting_text`，绝不注入 `MessageEvent`。持久化必须先于 ack。
 
 #### 已实现的进度卡合同
 
@@ -171,6 +172,16 @@ POST /v1/bot/events/{event_id}/ack
 - 首帧发送卡，后续用 transient edit，完成/错误/中断写 final frame；
 - card 不取代最终答案，最终答案由 Hermes 缓冲完成后通过普通 Text 消息一次发送；
 - capability 不支持时 fail-soft：回退现有文字进度或静默，绝不阻断答案。
+
+#### 已实现的 clarify 合同
+
+- 运行时读取并按 PEP 440 解析 `hermes-agent` 版本一次；`>=0.20.0` 启用原生 Type-17 clarify，`0.14`–`0.19`、未知或不可解析版本调用 Hermes 基类文本 fallback；
+- 必须同时匹配 gateway pending `clarify_id/session_key/question/choices/multi_select` 与可信当前 Octo route；不接受模型提供 channel、requester、session 或答案映射；
+- 单选每个 choice 使用 opaque `Action.Submit` id；多选使用 `Input.ChoiceSet(isMultiSelect=true)`，点击后按 gateway 原 choices 顺序回传 canonical JSON 数组；
+- **Other** 只调用 `mark_awaiting_text(clarify_id)`，保留同一 pending clarify 供下一条文本解析；
+- action 仍经过 message/channel/operator/binding/input、幂等 claim 与 replay 门控；已失效或已解决的 clarify 显示 expired，不创建新模型 turn；
+- profile/capability/render 或明确未创建 card 的 POST 拒绝走文本 fallback；timeout、断连、5xx、409/429 等不确定结果仅用同一 `client_msg_no` 重试一次，仍失败则返回失败，不发送第二个 prompt；
+- `OCTO_ON_BEHALF_OF` 下 Type-17 不受支持，clarify 保持 Hermes 文本 fallback；无单独配置开关。
 
 #### 插件内集成方案
 
@@ -255,13 +266,12 @@ git diff --cached --check
 - [x] fresh read-only security/lifecycle/protocol review：无残留 Blocker / High / Medium；
 - [ ] 经逐项授权的实服 feature manifest、display card、progress card、interactive action、media、thread 权限验证。
 
-最终本地证据（2026-08-06）：
+最新本地证据（2026-08-07）：
 
-- 当前环境与 `hermes-agent==0.14.*` 无缓存隔离环境均为 `711 passed, 1 skipped`；
+- 当前项目环境、实际 Hermes `0.20.0` 源码环境与 `hermes-agent==0.14.*` 无缓存隔离环境均为 `743 passed, 1 skipped`；
 - `ruff check .` 与 `uv lock --check` 通过；
-- wheel/sdist 无缓存安装与 package-data smoke 通过；
-- wheel SHA-256：`67b3ab10a5995eea0ccac8a8cc37fdbb20cdc59f49ad723e4e252ce3379e92ab`；
-- sdist SHA-256：`9f4232ba034a0e1300800c5196f83a7b0b88361426716662540c75ec9510e781`。
+- 2026-08-06 的 wheel/sdist 无缓存安装、package-data smoke 与对应构建哈希仍是上一构建证据；本次 clarify 修改后尚未重新构建发布产物；
+- fresh clarify lifecycle review 发现的版本签名、多选权威源、无效提交占用、pending 重验问题均已补回归并修复；实服 Type-17 clarify 仍待单独授权验收。
 
 实服动作必须使用临时对象并清理。不得自动发送群消息、上传媒体、创建/删除 thread、替换活跃插件、重启 gateway、commit、push 或开 PR；这些分别等待明确授权。
 
