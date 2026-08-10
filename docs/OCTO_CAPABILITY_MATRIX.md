@@ -1,9 +1,9 @@
 # Octo 全功能协议能力矩阵
 
-> 状态：本地实现与审查完成，待逐项授权的实服验收
+> 状态：本地实现、复核与发布产物验证完成，待逐项授权的实服验收
 > 基线：`b5661d06f96a8d82fff5140602a65df566d4849b`
 > 分支：`feat/protocol-parity-hardening`
-> 最后核对：2026-08-06
+> 最后核对：2026-08-10
 
 本文档回答三个问题：当前插件已经能做什么、仍缺什么、每一项如何验收。实现状态以代码和测试为准，不以产品宣传或旧审计结论为准。
 
@@ -266,12 +266,7 @@ git diff --cached --check
 - [x] fresh read-only security/lifecycle/protocol review：无残留 Blocker / High / Medium；
 - [ ] 经逐项授权的实服 feature manifest、display card、progress card、interactive action、media、thread 权限验证。
 
-最新本地证据（2026-08-07）：
-
-- 当前项目环境、实际 Hermes `0.20.0` 源码环境与 `hermes-agent==0.14.*` 无缓存隔离环境均为 `743 passed, 1 skipped`；
-- `ruff check .` 与 `uv lock --check` 通过；
-- 2026-08-06 的 wheel/sdist 无缓存安装、package-data smoke 与对应构建哈希仍是上一构建证据；本次 clarify 修改后尚未重新构建发布产物；
-- fresh clarify lifecycle review 发现的版本签名、多选权威源、无效提交占用、pending 重验问题均已补回归并修复；实服 Type-17 clarify 仍待单独授权验收。
+最新本地证据（2026-08-10）：目标行为回归 `237 passed, 1 skipped`；当前项目、未缓存的当前依赖隔离环境、当前 Hermes editable 及 `hermes-agent==0.14.*` 最低兼容隔离环境均为 `768 passed, 1 skipped`；`ruff check .` 与 `uv lock --check` 通过。wheel/sdist 构建及无缓存 wheel 隔离导入、package-data smoke 通过；wheel SHA-256 `4ba8e6fa21f563b31400afdfcfc0c317896d2504cd2aad5928237bd5cc549458`，sdist SHA-256 `35dbf6a562865137337187ef040485a1343918dcef60a9ae41fbc277b3684ca6`。fresh read-only review 复核本轮 Critical/Important 修复后无残留 blocker。
 
 实服动作必须使用临时对象并清理。不得自动发送群消息、上传媒体、创建/删除 thread、替换活跃插件、重启 gateway、commit、push 或开 PR；这些分别等待明确授权。
 
@@ -293,6 +288,8 @@ git diff --cached --check
 - [x] GROUP/THREAD 条件写能力核验（结论：BLOCKED-UPSTREAM）
 - [ ] thread join/leave 非 creator 实服边界
 - [x] 独立只读审查与最终本地回归
+- [x] Agent-facing skill 与原始 Bot API 运维说明拆分
+- [x] `octo_card_profile` 从 LLM 工具面移除，内部自动协商保留
 - [ ] 经逐项授权的实服 manifest/card/action/media/thread 验收
 
 ## 7. 实服验收清单（未执行）
