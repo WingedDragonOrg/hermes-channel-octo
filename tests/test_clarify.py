@@ -270,6 +270,69 @@ async def test_hermes_020_multi_select_clarify_uses_choiceset_contract() -> None
     ]
 
 
+def test_multi_clarify_completed_card_shows_canonical_choices() -> None:
+    session = _clarify_session(
+        clarify_id="clarify-result-multi",
+        multi_select=True,
+    )
+    action = _clarify_action(
+        "clarify_confirm",
+        inputs={"clarify_choices": "clarify_choice_2,clarify_choice_0"},
+    )
+
+    rendered = card_events.render_card_action_status(session, action, "completed")
+
+    visible = "\n".join(
+        node.get("text", "")
+        for node in _card_nodes(rendered.card, "TextBlock")
+    )
+    assert "需要确认" in visible
+    assert "Choose several" in visible
+    assert "已选择" in visible
+    assert "A、C" in visible
+    assert "已提交" in visible
+    assert "clarify_choice_" not in visible
+    assert _ROUTE.requester_uid not in visible
+    assert "clarify_choice_" not in rendered.plain
+    assert _ROUTE.requester_uid not in rendered.plain
+    assert not _card_nodes(rendered.card, "Input.ChoiceSet")
+    assert not _card_nodes(rendered.card, "Action.Submit")
+
+
+def test_single_clarify_completed_card_shows_canonical_choice() -> None:
+    rendered = card_events.render_card_action_status(
+        _clarify_session(clarify_id="clarify-result-single"),
+        _clarify_action("clarify_choice_1"),
+        "completed",
+    )
+
+    assert "已选择\nB" in rendered.plain
+    assert rendered.plain.endswith("已提交")
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        ("processing", "正在提交…"),
+        ("awaiting_text", "请直接发送文字回复"),
+        ("expired", "该确认已失效或已处理"),
+        ("failed", "提交失败，请重试"),
+    ],
+)
+def test_clarify_card_uses_localized_status_without_internal_identity(
+    status: str,
+    expected: str,
+) -> None:
+    rendered = card_events.render_card_action_status(
+        _clarify_session(clarify_id=f"clarify-result-{status}"),
+        _clarify_action("clarify_other"),
+        status,
+    )
+
+    assert expected in rendered.plain
+    assert _ROUTE.requester_uid not in rendered.plain
+    assert "已选择" not in rendered.plain
+
 def _clarify_session(
     *,
     clarify_id: str,

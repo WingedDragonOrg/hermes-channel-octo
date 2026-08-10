@@ -517,6 +517,81 @@ def _freeze_action_node(
             frozen[key] = value
     return frozen
 
+def _clarify_selected_choices(
+    clarify: ClarifySession,
+    action: CardAction,
+) -> list[str]:
+    if action.action_id == clarify.other_action_id:
+        return []
+    if not clarify.multi_select:
+        return [
+            choice
+            for action_id, choice in clarify.action_choices
+            if action_id == action.action_id
+        ]
+    if action.action_id != clarify.confirm_action_id or clarify.input_id is None:
+        return []
+    raw_selection = action.inputs.get(clarify.input_id, "")
+    selected_ids = raw_selection.split(",") if raw_selection else []
+    if (
+        not selected_ids
+        or any(not value or value.strip() != value for value in selected_ids)
+        or len(set(selected_ids)) != len(selected_ids)
+    ):
+        return []
+    selected = set(selected_ids)
+    known_ids = {choice_id for choice_id, _ in clarify.action_choices}
+    if not selected.issubset(known_ids):
+        return []
+    return [
+        choice
+        for choice_id, choice in clarify.action_choices
+        if choice_id in selected
+    ]
+
+
+def _render_clarify_action_status(
+    session: CardSession,
+    action: CardAction,
+    status: str,
+) -> CardRenderResult:
+    clarify = session.clarify
+    if clarify is None:
+        raise ValueError("clarify session is required")
+    status_line = {
+        "processing": "正在提交…",
+        "completed": "已提交",
+        "awaiting_text": "请直接发送文字回复",
+        "expired": "该确认已失效或已处理",
+        "failed": "提交失败，请重试",
+    }.get(status, "提交失败，请重试")
+    lines = ["需要确认", clarify.question]
+    selected = (
+        _clarify_selected_choices(clarify, action)
+        if status in {"processing", "completed"}
+        else []
+    )
+    if selected:
+        lines.extend(("已选择", "、".join(selected)))
+    lines.append(status_line)
+    body = [
+        {
+            "type": "TextBlock",
+            "text": text,
+            "wrap": True,
+            **(
+                {"weight": "Bolder", "size": "Medium"}
+                if index == 0
+                else {"spacing": "Medium" if text in {"已选择", status_line} else "Small"}
+            ),
+        }
+        for index, text in enumerate(lines)
+    ]
+    card = {key: value for key, value in session.card.items() if key != "actions"}
+    card["body"] = body
+    return CardRenderResult(card=card, plain="\n".join(lines))
+
+
 
 def render_card_action_status(
     session: CardSession,
@@ -524,6 +599,8 @@ def render_card_action_status(
     status: str,
 ) -> CardRenderResult:
     """Freeze submitted controls and append a disclosure-safe terminal status."""
+    if session.clarify is not None:
+        return _render_clarify_action_status(session, action, status)
     source_body = session.card.get("body")
     body: list[dict[str, Any]] = []
     if isinstance(source_body, list):
