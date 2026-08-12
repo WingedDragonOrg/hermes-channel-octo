@@ -17,6 +17,7 @@ from hermes_octo_plugin.protocol import (
     derive_aes_key,
     encode_connect_packet,
     encode_ping_packet,
+    encode_pong_packet,
     encode_recvack_packet,
     decode_packet,
     try_unpack_one,
@@ -218,6 +219,9 @@ class TestPacketEncoding:
         ping = encode_ping_packet()
         assert len(ping) == 1
         assert (ping[0] >> 4) == PacketType.PING
+
+    def test_pong_packet(self):
+        assert encode_pong_packet() == bytes([(PacketType.PONG << 4) | 0])
 
     def test_recvack_packet(self):
         ack = encode_recvack_packet("12345", 1)

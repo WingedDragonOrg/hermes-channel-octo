@@ -10,6 +10,7 @@ import pytest
 
 from hermes_octo_plugin import api
 from hermes_octo_plugin.adapter import HTTP_HEARTBEAT_INTERVAL_S
+from hermes_octo_plugin.protocol import encode_ping_packet, encode_pong_packet
 from tests.conftest import make_bare_adapter
 
 
@@ -62,6 +63,38 @@ async def test_ws_heartbeat_keeps_ping_cadence_independent():
 
     assert delays == [adapter._heartbeat_interval_s]
     adapter._ws.send.assert_awaited_once_with(b"ping")
+
+
+@pytest.mark.asyncio
+async def test_server_ping_sends_pong_response():
+    adapter = make_bare_adapter()
+    websocket = MagicMock()
+    websocket.send = AsyncMock()
+    adapter._ws = websocket
+
+    await adapter._handle_frame(encode_ping_packet())
+
+    websocket.send.assert_awaited_once_with(encode_pong_packet())
+
+
+@pytest.mark.asyncio
+async def test_server_ping_without_websocket_is_ignored():
+    adapter = make_bare_adapter()
+    adapter._ws = None
+
+    await adapter._handle_frame(encode_ping_packet())
+
+
+@pytest.mark.asyncio
+async def test_server_ping_send_failure_is_ignored():
+    adapter = make_bare_adapter()
+    websocket = MagicMock()
+    websocket.send = AsyncMock(side_effect=RuntimeError("websocket closed"))
+    adapter._ws = websocket
+
+    await adapter._handle_frame(encode_ping_packet())
+
+    websocket.send.assert_awaited_once_with(encode_pong_packet())
 
 
 @pytest.mark.asyncio
