@@ -63,6 +63,7 @@ from .protocol import (
     derive_aes_key,
     encode_connect_packet,
     encode_ping_packet,
+    encode_pong_packet,
     encode_recvack_packet,
     generate_device_id,
     generate_keypair,
@@ -2482,6 +2483,16 @@ class OctoAdapter(BasePlatformAdapter):
         pkt_type, result = decode_packet(frame)
         if pkt_type == PacketType.PONG:
             self._ping_retry_count = 0
+        elif pkt_type == PacketType.PING:
+            if self._ws:
+                try:
+                    await self._ws.send(encode_pong_packet())
+                except Exception as e:
+                    logger.debug(
+                        "[%s] PONG response failed: %s",
+                        self.name,
+                        redact_log(str(e)),
+                    )
         elif pkt_type == PacketType.RECV:
             await self._handle_recv(result)
         elif pkt_type == PacketType.DISCONNECT:

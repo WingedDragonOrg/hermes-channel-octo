@@ -354,6 +354,11 @@ def encode_ping_packet() -> bytes:
     return bytes([(PacketType.PING << 4) | 0])
 
 
+def encode_pong_packet() -> bytes:
+    """Encode a PONG packet (single byte)."""
+    return bytes([(PacketType.PONG << 4) | 0])
+
+
 def encode_recvack_packet(message_id: str, message_seq: int) -> bytes:
     """
     Encode a RECVACK packet.
