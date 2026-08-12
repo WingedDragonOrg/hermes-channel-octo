@@ -2,6 +2,9 @@
 Shared pytest configuration and fixtures.
 """
 
+import asyncio
+from collections import OrderedDict
+
 import pytest
 
 
@@ -14,6 +17,7 @@ def pytest_configure(config):
     """
     try:
         from hermes_cli.plugins import discover_plugins  # type: ignore
+
         discover_plugins()
     except Exception:  # pragma: no cover — running tests without hermes is OK
         pass
@@ -39,25 +43,41 @@ def make_bare_adapter():
         NAME_CACHE_MAX_SIZE,
         OctoAdapter,
         PING_MAX_RETRY,
+        UNKNOWN_MESSAGE_TYPE_TELEMETRY_CAP,
     )
+    from hermes_octo_plugin import cards
+    from hermes_octo_plugin.card_events import CardSessionRegistry
 
     a = object.__new__(OctoAdapter)
     # Name resolution / membership maps
     a._uid_to_name = {}
     a._base_uid_to_name = {}
     a._member_map = {}
+    a._group_member_rosters = {}
+    a._group_robot_map = {}
     a._name_cache = LRUCache(max_size=NAME_CACHE_MAX_SIZE)
     a._user_group_index = {}
     a._group_names = {}
     a._known_group_ids = set()
     # Per-channel caches
     a._chat_kind = {}
+    a._space_dm_targets = {}
     a._group_md_cache = {}
     a._group_md_checked = set()
+    a._group_scope_generations = {}
     a._group_histories = {}
     a._group_cache_timestamps = {}
     a._cache_activity = {}
-    a._active_streams = {}
+    a._progress_tasks = set()
+    a._gateway_loop = None
+    a._event_poller = None
+    a._event_task = None
+    a._card_sessions = CardSessionRegistry()
+    a._card_profile_cache = cards.CardProfileCache()
+    a._native_clarify_enabled = False
+    a._unknown_message_type_counts = OrderedDict()
+    a._unknown_message_type_log_budget = UNKNOWN_MESSAGE_TYPE_TELEMETRY_CAP
+    a._disconnecting = False
     # Connection / lifecycle state
     a._ws = None
     a._http_session = None
@@ -68,18 +88,32 @@ def make_bare_adapter():
     a._reconnect_in_progress = False
     a._last_token_refresh = 0.0
     a._ping_retry_count = 0
+    a._http_heartbeat_disabled = False
+    a._http_heartbeat_task = None
+    a._heartbeat_task = None
+    a._recv_task = None
+    a._cache_cleanup_task = None
+    a._reconnect_task = None
+    a._prefetch_task = None
+    a._lifecycle_lock = asyncio.Lock()
     # Identity / config (callers override as needed)
     a._api_url = ""
+    a._cdn_url = ""
+    a._ws_url = ""
     a._bot_token = ""
+    a._on_behalf_of = ""
     a._robot_id = ""
     a._owner_uid = ""
     a._history_limit = DEFAULT_HISTORY_LIMIT
     a._require_mention = True
     a._ignore_mention_all = False
     a._history_prompt_template = DEFAULT_HISTORY_PROMPT_TEMPLATE
-    a._stream_threshold = 500
+    a._progress_card_renderer = "local"
     a._heartbeat_interval_s = float(HEARTBEAT_INTERVAL)
     a._ping_max_retry = int(PING_MAX_RETRY)
+    a._event_poll_interval_s = 2.0
+    a._event_poll_wait_s = 25
+    a._event_poll_limit = 50
     return a
 
 

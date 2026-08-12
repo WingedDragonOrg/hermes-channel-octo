@@ -42,8 +42,11 @@ class TestMessageType:
     def test_rich_text(self):
         assert MessageType.RichText == 14
 
+    def test_interactive_card(self):
+        assert MessageType.InteractiveCard == 17
+
     def test_all_types(self):
-        expected = {1, 2, 3, 4, 5, 6, 7, 8, 11, 14}
+        expected = {1, 2, 3, 4, 5, 6, 7, 8, 11, 14, 17}
         actual = {mt.value for mt in MessageType}
         assert actual == expected
 
@@ -71,6 +74,16 @@ class TestMentionPayload:
         mp = MentionPayload(all=True)
         assert mp.all is True
 
+    def test_wire_broadcast_flags_preserve_human_and_ai_meaning(self):
+        payload = MessagePayload.from_dict(
+            {"type": 1, "content": "notice", "mention": {"all": 1, "humans": 0, "ais": 1}}
+        )
+
+        assert payload.mention is not None
+        assert payload.mention.all is True
+        assert payload.mention.humans is False
+        assert payload.mention.ais is True
+
 
 class TestReplyPayload:
     def test_default_none(self):
@@ -94,6 +107,10 @@ class TestMessagePayload:
         mp = MessagePayload()
         assert mp.type == MessageType.Text
         assert mp.content is None
+
+    def test_unknown_numeric_type_is_preserved_not_coerced_to_text(self):
+        payload = MessagePayload.from_dict({"type": 999, "content": "opaque"})
+        assert payload.type == 999
 
     def test_from_dict_text(self):
         data = {"type": 1, "content": "hello world"}
@@ -181,6 +198,54 @@ class TestMessagePayload:
         }
         mp = MessagePayload.from_dict(data)
         assert mp.event == {"type": "group_md_updated"}
+
+
+    def test_from_dict_drops_malformed_optional_wire_containers(self):
+        payload = MessagePayload.from_dict({
+            "type": 1,
+            "content": 42,
+            "url": 7,
+            "name": {"nested": "value"},
+            "mention": "not-an-object",
+            "reply": ["not-an-object"],
+            "event": "not-an-object",
+        })
+
+        assert payload.content is None
+        assert payload.url is None
+        assert payload.name is None
+        assert payload.mention is None
+        assert payload.reply is None
+        assert payload.event is None
+
+
+    def test_from_dict_filters_malformed_mentions_and_reply_fields(self):
+        payload = MessagePayload.from_dict({
+            "type": 1,
+            "mention": {
+                "uids": ["valid", 42, ""],
+                "entities": [
+                    {"uid": "valid", "offset": 0, "length": 5},
+                    {"uid": 42, "offset": 0, "length": 5},
+                    {"uid": "missing-offset"},
+                ],
+            },
+            "reply": {
+                "payload": "not-an-object",
+                "from_uid": 42,
+                "from_name": ["Alice"],
+            },
+        })
+
+        assert payload.mention is not None
+        assert payload.mention.uids == ["valid"]
+        assert payload.mention.entities == [
+            MentionEntity(uid="valid", offset=0, length=5)
+        ]
+        assert payload.reply is not None
+        assert payload.reply.payload is None
+        assert payload.reply.from_uid is None
+        assert payload.reply.from_name is None
 
 
 class TestBotMessage:

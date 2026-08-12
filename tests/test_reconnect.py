@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -13,6 +15,7 @@ from hermes_octo_plugin.adapter import (
     RECONNECT_STAGGER_MAX_S,
     TOKEN_REFRESH_COOLDOWN_S,
 )
+from hermes_octo_plugin.protocol import PacketType
 from tests.conftest import make_bare_adapter
 
 
@@ -24,10 +27,166 @@ def _make_adapter() -> OctoAdapter:
     a._need_reconnect = True
     a._api_url = "https://example.test"
     a._bot_token = "tok"
+    # Reconnect tests mock every API/WS operation and do not exercise aiohttp
+    # ownership.  Seed a non-network session so direct private _do_connect()
+    # calls cannot allocate a real ClientSession that only disconnect() owns.
+    a._http_session = MagicMock()
     return a
 
 
 # ─── Reconnect dedup ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_connect_reentry_closes_previous_owned_http_session():
+    a = _make_adapter()
+    a._http_session = None
+    a._reconnect_task = None
+    a._heartbeat_task = None
+    a._http_heartbeat_task = None
+    a._recv_task = None
+    a._cache_cleanup_task = None
+    a._ws = None
+    a._mark_disconnected = MagicMock()
+    first = MagicMock()
+    first.close = AsyncMock()
+    second = MagicMock()
+    second.close = AsyncMock()
+    a._do_connect = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+    with patch(
+        "hermes_octo_plugin.adapter.aiohttp.ClientSession",
+        side_effect=[first, second],
+    ):
+        assert await a.connect() is True
+        assert await a.connect() is True
+
+    first.close.assert_awaited_once()
+    assert a._http_session is second
+
+
+@pytest.mark.asyncio
+async def test_concurrent_connect_calls_never_overlap_handshakes():
+    a = _make_adapter()
+    a._http_session = None
+    a._ws = None
+    a._mark_disconnected = MagicMock()
+    first_session = MagicMock()
+    first_session.close = AsyncMock()
+    second_session = MagicMock()
+    second_session.close = AsyncMock()
+    a._new_http_session = MagicMock(  # type: ignore[method-assign]
+        side_effect=[first_session, second_session]
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    active = 0
+    max_active = 0
+
+    async def delayed_connect():
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        entered.set()
+        await release.wait()
+        active -= 1
+        return True
+
+    a._do_connect = delayed_connect  # type: ignore[method-assign]
+    first = asyncio.create_task(a.connect())
+    await entered.wait()
+    second = asyncio.create_task(a.connect())
+    await asyncio.sleep(0)
+    assert max_active == 1
+    release.set()
+    assert await first is True
+    assert await second is True
+    assert max_active == 1
+    first_session.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cold_connect_failure_closes_partial_transport_resources(caplog):
+    a = _make_adapter()
+    a._http_session = None
+    a._reconnect_task = None
+    a._heartbeat_task = None
+    a._http_heartbeat_task = None
+    a._recv_task = None
+    a._cache_cleanup_task = None
+    a._ws = None
+    a._mark_disconnected = MagicMock()
+    session = MagicMock()
+    session.close = AsyncMock()
+    a._do_connect = AsyncMock(  # type: ignore[method-assign]
+        side_effect=RuntimeError("Authorization=Bearer secret-connect-token")
+    )
+
+    with patch(
+        "hermes_octo_plugin.adapter.aiohttp.ClientSession",
+        return_value=session,
+    ):
+        assert await a.connect() is False
+
+    session.close.assert_awaited_once()
+    assert a._http_session is None
+    assert "secret-connect-token" not in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
+
+@pytest.mark.asyncio
+async def test_repeated_connect_cancellation_cannot_interrupt_session_close():
+    a = _make_adapter()
+    a._http_session = None
+    a._ws = None
+    a._reconnect_task = None
+    a._heartbeat_task = None
+    a._http_heartbeat_task = None
+    a._recv_task = None
+    a._cache_cleanup_task = None
+    a._prefetch_task = None
+    connect_entered = asyncio.Event()
+    close_entered = asyncio.Event()
+    release_close = asyncio.Event()
+    close_completed = asyncio.Event()
+    close_cancelled = False
+
+    session = MagicMock()
+
+    async def protected_close():
+        nonlocal close_cancelled
+        close_entered.set()
+        try:
+            await release_close.wait()
+            close_completed.set()
+        except asyncio.CancelledError:
+            close_cancelled = True
+            raise
+
+    session.close = protected_close
+    a._new_http_session = MagicMock(return_value=session)  # type: ignore[method-assign]
+
+    async def blocked_connect() -> bool:
+        connect_entered.set()
+        await asyncio.Event().wait()
+        return True
+
+    a._do_connect = blocked_connect  # type: ignore[method-assign]
+    task = asyncio.create_task(a.connect())
+    await connect_entered.wait()
+    task.cancel()
+    await close_entered.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    release_close.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert close_cancelled is False
+    assert close_completed.is_set()
+    assert a._http_session is None
 
 
 @pytest.mark.asyncio
@@ -96,7 +255,185 @@ async def test_reconnect_skipped_when_need_reconnect_false():
 
 
 @pytest.mark.asyncio
-async def test_reconnect_reschedules_on_connect_failure():
+async def test_disconnect_cancels_inflight_reconnect_before_it_can_resurrect_adapter():
+    a = _make_adapter()
+    entered_connect = asyncio.Event()
+    release_connect = asyncio.Event()
+    a._heartbeat_task = None
+    a._http_heartbeat_task = None
+    a._recv_task = None
+    a._cache_cleanup_task = None
+    a._ws = None
+    a._mark_disconnected = MagicMock()
+
+    session = MagicMock()
+    session.close = AsyncMock()
+    a._http_session = session
+
+    async def delayed_connect():
+        entered_connect.set()
+        await release_connect.wait()
+        a._connected = True
+        return True
+
+    a._do_connect = delayed_connect  # type: ignore[method-assign]
+
+    with patch("hermes_octo_plugin.adapter.asyncio.sleep", new=AsyncMock()):
+        reconnect_task = asyncio.create_task(a._schedule_reconnect())
+        a._reconnect_task = reconnect_task
+        await entered_connect.wait()
+        try:
+            await a.disconnect()
+            assert reconnect_task.done()
+            assert a._connected is False
+            session.close.assert_awaited_once()
+        finally:
+            release_connect.set()
+            if not reconnect_task.done():
+                reconnect_task.cancel()
+            await asyncio.gather(reconnect_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_while_draining_reconnect_still_finishes_disconnect():
+    a = _make_adapter()
+    a._connected = True
+    a._heartbeat_task = None
+    a._http_heartbeat_task = None
+    a._recv_task = None
+    a._cache_cleanup_task = None
+    a._prefetch_task = None
+    a._ws = None
+    a._mark_disconnected = MagicMock()
+    session = MagicMock()
+    session.close = AsyncMock()
+    a._http_session = session
+    draining = asyncio.Event()
+    release = asyncio.Event()
+
+    async def reconnect_cleanup():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            draining.set()
+            await release.wait()
+
+    reconnect_task = asyncio.create_task(reconnect_cleanup())
+    a._reconnect_task = reconnect_task
+    disconnect_task = asyncio.create_task(a.disconnect())
+    await draining.wait()
+
+    disconnect_task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await disconnect_task
+
+    assert reconnect_task.done()
+    assert a._connected is False
+    assert a._http_session is None
+    session.close.assert_awaited_once()
+    a._mark_disconnected.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_stops_card_event_poller() -> None:
+    a = _make_adapter()
+    a._reconnect_task = None
+    a._heartbeat_task = None
+    a._http_heartbeat_task = None
+    a._recv_task = None
+    a._cache_cleanup_task = None
+    a._prefetch_task = None
+    a._ws = None
+    a._http_session = None
+    a._mark_disconnected = MagicMock()
+    poller = MagicMock()
+    a._event_poller = poller
+    a._event_task = None
+
+    await a.disconnect()
+
+    poller.stop.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cancels_prefetch_before_closing_session():
+    a = _make_adapter()
+    a._reconnect_task = None
+    a._heartbeat_task = None
+    a._http_heartbeat_task = None
+    a._recv_task = None
+    a._cache_cleanup_task = None
+    a._ws = None
+    a._mark_disconnected = MagicMock()
+    session = MagicMock()
+    session.close = AsyncMock()
+    a._http_session = session
+    started = asyncio.Event()
+
+    async def prefetch():
+        started.set()
+        await asyncio.Event().wait()
+
+    a._prefetch_task = asyncio.create_task(prefetch())
+    await started.wait()
+    await a.disconnect()
+
+    assert a._prefetch_task is None
+    session.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_repeated_disconnect_cancellation_cannot_cancel_transport_cleanup():
+    a = _make_adapter()
+    a._reconnect_task = None
+    a._heartbeat_task = None
+    a._http_heartbeat_task = None
+    a._recv_task = None
+    a._cache_cleanup_task = None
+    a._prefetch_task = None
+    a._ws = None
+    a._mark_disconnected = MagicMock()
+    close_entered = asyncio.Event()
+    release_close = asyncio.Event()
+    close_completed = asyncio.Event()
+    close_cancelled = False
+
+    session = MagicMock()
+
+    async def protected_close():
+        nonlocal close_cancelled
+        close_entered.set()
+        try:
+            await release_close.wait()
+            close_completed.set()
+        except asyncio.CancelledError:
+            close_cancelled = True
+            raise
+
+    session.close = protected_close
+    a._http_session = session
+
+    task = asyncio.create_task(a.disconnect())
+    await close_entered.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    release_close.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert close_cancelled is False
+    assert close_completed.is_set()
+    a._mark_disconnected.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_reschedules_on_connect_failure(caplog):
     """When _do_connect raises, a fresh reconnect task is spawned."""
     a = _make_adapter()
     calls = 0
@@ -105,7 +442,7 @@ async def test_reconnect_reschedules_on_connect_failure():
         nonlocal calls
         calls += 1
         if calls < 2:
-            raise RuntimeError("simulated failure")
+            raise RuntimeError("SessionToken=secret-reconnect-token")
 
     a._do_connect = flaky_connect  # type: ignore[method-assign]
 
@@ -119,14 +456,197 @@ async def test_reconnect_reschedules_on_connect_failure():
         spawned.append(task)
         return task
 
-    with patch("hermes_octo_plugin.adapter.asyncio.sleep", new=AsyncMock()), \
-         patch("hermes_octo_plugin.adapter.asyncio.create_task", new=capture_create_task):
+    with (
+        patch("hermes_octo_plugin.adapter.asyncio.sleep", new=AsyncMock()),
+        patch(
+            "hermes_octo_plugin.adapter.asyncio.create_task", new=capture_create_task
+        ),
+    ):
         await a._schedule_reconnect()
         # Drain the rescheduled task that was create_task'd.
         for t in spawned:
             await t
 
     assert calls >= 2, "failure should trigger a retry"
+    assert "secret-reconnect-token" not in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_do_connect_prefers_configured_websocket_url():
+    adapter = _make_adapter()
+    adapter._ws_url = "wss://override.example/socket"
+    registration = MagicMock(
+        robot_id="bot",
+        owner_uid="owner",
+        im_token="token",
+        ws_url="wss://server.example/socket",
+    )
+    guarded_socket = MagicMock()
+    open_socket = AsyncMock(return_value=guarded_socket)
+    connect = AsyncMock(side_effect=RuntimeError("stop after URL selection"))
+
+    with (
+        patch(
+            "hermes_octo_plugin.adapter.api.register_bot",
+            AsyncMock(return_value=registration),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter._open_guarded_websocket_socket",
+            open_socket,
+            create=True,
+        ),
+        patch("hermes_octo_plugin.adapter.websockets.connect", connect),
+    ):
+        with pytest.raises(RuntimeError, match="URL selection"):
+            await adapter._do_connect()
+
+    assert connect.await_args.args[0] == "wss://override.example/socket"
+    open_socket.assert_awaited_once_with("wss://override.example/socket")
+    assert connect.await_args.kwargs["sock"] is guarded_socket
+    assert connect.await_args.kwargs["proxy"] is None
+    guarded_socket.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_registration_info_log_omits_robot_and_owner_ids(caplog):
+    adapter = _make_adapter()
+    robot_id = "stable-robot-id"
+    owner_id = "stable-owner-id"
+    registration = MagicMock(
+        robot_id=robot_id,
+        owner_uid=owner_id,
+        im_token="token",
+        ws_url="wss://server.example/socket",
+    )
+    caplog.set_level(logging.INFO, logger="hermes_octo_plugin.adapter")
+
+    with (
+        patch(
+            "hermes_octo_plugin.adapter.api.register_bot",
+            AsyncMock(return_value=registration),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter._open_guarded_websocket_socket",
+            AsyncMock(return_value=MagicMock()),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.websockets.connect",
+            AsyncMock(side_effect=RuntimeError("stop after registration")),
+        ),
+        pytest.raises(RuntimeError, match="stop after registration"),
+    ):
+        await adapter._do_connect()
+
+    assert "Bot registered" in caplog.text
+    assert robot_id not in caplog.text
+    assert owner_id not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_guarded_socket_closes_when_cancellation_precedes_websocket_handoff():
+    adapter = _make_adapter()
+    registration = MagicMock(
+        robot_id="bot",
+        owner_uid="owner",
+        im_token="token",
+        ws_url="wss://server.example/socket",
+    )
+    guarded_socket = MagicMock()
+    opened = asyncio.Event()
+
+    async def open_socket(_url: str):
+        asyncio.get_running_loop().call_soon(opened.set)
+        return guarded_socket
+
+    async def pre_handoff_connect(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    with (
+        patch(
+            "hermes_octo_plugin.adapter.api.register_bot",
+            AsyncMock(return_value=registration),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter._open_guarded_websocket_socket",
+            open_socket,
+        ),
+        patch("hermes_octo_plugin.adapter.websockets.connect", pre_handoff_connect),
+    ):
+        task = asyncio.create_task(adapter._do_connect())
+        await opened.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert adapter._ws is None
+    guarded_socket.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_successful_websocket_handoff_does_not_close_guarded_socket():
+    adapter = _make_adapter()
+    adapter._cache_cleanup_task = MagicMock()
+    adapter._prefetch_task = MagicMock()
+    registration = MagicMock(
+        robot_id="bot",
+        owner_uid="owner",
+        im_token="token",
+        ws_url="wss://server.example/socket",
+    )
+    guarded_socket = MagicMock()
+    websocket = MagicMock()
+    websocket.send = AsyncMock()
+    websocket.recv = AsyncMock(return_value=b"connack")
+    connack = MagicMock(
+        reason_code=1,
+        server_key="c2VydmVyLXB1YmxpYy1rZXk=",
+        salt="0123456789abcdef",
+        server_version=4,
+    )
+
+    with (
+        patch(
+            "hermes_octo_plugin.adapter.api.register_bot",
+            AsyncMock(return_value=registration),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter._open_guarded_websocket_socket",
+            AsyncMock(return_value=guarded_socket),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.websockets.connect",
+            AsyncMock(return_value=websocket),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.generate_keypair",
+            return_value=(MagicMock(), b"client-public-key"),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.compute_shared_secret",
+            return_value=b"shared-secret",
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.derive_aes_key",
+            return_value=b"derived-aes-key",
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.try_unpack_one",
+            return_value=(b"connack", bytearray()),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.decode_packet",
+            return_value=(PacketType.CONNACK, connack),
+        ),
+        patch.object(adapter, "_start_heartbeat_task", AsyncMock()),
+        patch.object(adapter, "_start_receive_task", AsyncMock()),
+        patch.object(adapter, "_start_card_event_poller"),
+        patch.object(adapter, "_mark_connected"),
+    ):
+        assert await adapter._do_connect() is True
+
+    assert adapter._ws is websocket
+    guarded_socket.close.assert_not_called()
 
 
 # ─── Token refresh cooldown ──────────────────────────────────────────────────
@@ -159,8 +679,10 @@ async def test_token_refresh_skipped_within_cooldown():
     # (e.g. fresh CI containers).
     a._last_token_refresh = time.monotonic() - (TOKEN_REFRESH_COOLDOWN_S + 10)
 
-    with patch("hermes_octo_plugin.adapter.api.register_bot", new=fake_register_bot), \
-         patch.object(a, "_ws", None):
+    with (
+        patch("hermes_octo_plugin.adapter.api.register_bot", new=fake_register_bot),
+        patch.object(a, "_ws", None),
+    ):
         # Stop _do_connect at the registration call — anything beyond would
         # need a real WS. We only care about the force_refresh decision.
         try:
@@ -188,7 +710,10 @@ async def test_token_refresh_resumes_after_cooldown():
     async def fake_register_bot(_session, _api_url, _bot_token, *, force_refresh=False):
         refresh_calls.append(force_refresh)
         m = MagicMock()
-        m.robot_id = "bot"; m.owner_uid = "owner"; m.im_token = "t"; m.ws_url = "wss://e"
+        m.robot_id = "bot"
+        m.owner_uid = "owner"
+        m.im_token = "t"
+        m.ws_url = "wss://e"
         return m
 
     a._reconnect_attempts = 1

@@ -1,95 +1,18 @@
-"""
-Tests for issue #225 fixes:
-- Filename decoding in download_file
-- _build_content_disposition helper
-- upload_file_to_cos Content-Disposition header
-- upload_and_get_url parameter forwarding
-"""
+"""Backend-agnostic presigned media upload and filename decoding contracts."""
 
-import inspect
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import unquote
 
+import pytest
+
 from hermes_octo_plugin.api import (
-    _build_content_disposition,
-    upload_file_to_cos,
-    upload_and_get_url,
     download_file,
+    get_upload_presign,
+    upload_and_get_url,
+    upload_file_to_presigned_url,
 )
 
 
-# ---------------------------------------------------------------------------
-# _build_content_disposition — unit tests
-# ---------------------------------------------------------------------------
-class TestBuildContentDisposition:
-    def test_ascii_safe_filename(self):
-        result = _build_content_disposition("report.xlsx")
-        assert result == 'attachment; filename="report.xlsx"'
-
-    def test_ascii_with_quotes_falls_back(self):
-        result = _build_content_disposition('report"v2.xlsx')
-        assert 'filename="download.xlsx"' in result
-        assert "filename*=UTF-8''" in result
-        assert "%22" in result  # quote encoded
-
-    def test_ascii_with_backslash_falls_back(self):
-        result = _build_content_disposition("file\\path.txt")
-        assert 'filename="download.txt"' in result
-        assert "filename*=UTF-8''" in result
-
-    def test_ascii_with_semicolon_falls_back(self):
-        result = _build_content_disposition("file;name.txt")
-        assert 'filename="download.txt"' in result
-        assert "filename*=UTF-8''" in result
-
-    def test_non_ascii_chinese(self):
-        result = _build_content_disposition("审查.xlsx")
-        assert 'filename="download.xlsx"' in result
-        assert "filename*=UTF-8''" in result
-        assert "%E5%AE%A1%E6%9F%A5" in result
-
-    def test_mixed_ascii_and_chinese(self):
-        result = _build_content_disposition("Q3审查_report.xlsx")
-        assert 'filename="download.xlsx"' in result
-        assert "filename*=UTF-8''" in result
-
-    def test_ascii_with_apostrophe_is_safe(self):
-        result = _build_content_disposition("John's Report.xlsx")
-        assert result == """attachment; filename="John's Report.xlsx\""""
-
-    def test_non_ascii_with_apostrophe_encodes_apostrophe(self):
-        result = _build_content_disposition("审查's.xlsx")
-        assert "filename*=UTF-8''" in result
-        assert "%27" in result  # apostrophe encoded by quote(safe='')
-
-    def test_no_extension(self):
-        result = _build_content_disposition("审查报告")
-        assert 'filename="download"' in result
-        assert "filename*=UTF-8''" in result
-
-    def test_spaces_in_filename(self):
-        result = _build_content_disposition("my report.xlsx")
-        # Spaces are safe printable ASCII characters
-        assert result == 'attachment; filename="my report.xlsx"'
-
-    def test_control_chars_fall_back(self):
-        result = _build_content_disposition("file\x01name.txt")
-        assert 'filename="download.txt"' in result
-
-    def test_defaults_to_attachment(self):
-        result = _build_content_disposition("report.xlsx")
-        assert result.startswith("attachment;")
-
-    def test_inline_disposition_type(self):
-        result = _build_content_disposition("video.mp4", "inline")
-        assert result == 'inline; filename="video.mp4"'
-
-    def test_inline_with_non_ascii(self):
-        result = _build_content_disposition("视频.mp4", "inline")
-        assert result.startswith("inline;")
-        assert 'filename="download.mp4"' in result
-        assert "filename*=UTF-8''" in result
 
 
 # ---------------------------------------------------------------------------
@@ -112,287 +35,563 @@ class TestFilenameDecoding:
     def test_unquote_plain_ascii(self):
         assert unquote("report.xlsx") == "report.xlsx"
 
+    @pytest.mark.parametrize(
+        "filename",
+        ["\u202egnp.exe", "a\u200bb.txt", "a\u0085b.txt", "report.txt.", "report.txt "],
+    )
+    def test_safe_media_filename_rejects_format_controls_and_trailing_spoofing(
+        self,
+        filename,
+    ):
+        from hermes_octo_plugin.api import safe_media_filename
 
-# ---------------------------------------------------------------------------
-# upload_file_to_cos — Content-Disposition header
-# ---------------------------------------------------------------------------
-class TestUploadFileToCosContentDisposition:
+        assert safe_media_filename(filename) is None
+
+    def test_content_disposition_checks_decoded_filename_and_keeps_legacy_percent(self):
+        from hermes_octo_plugin.api import _content_disposition_filename
+
+        assert _content_disposition_filename(
+            "attachment; filename*=UTF-8''%0d%0aX-Injected:%201"
+        ) is None
+        assert _content_disposition_filename(
+            'attachment; filename="100%20.txt"'
+        ) == "100%20.txt"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content_disposition", "url", "expected_filename"),
+    [
+        (
+            "attachment; filename*=UTF-8''..%2Foutside.txt",
+            "https://files.example/report.txt",
+            "report.txt",
+        ),
+        (
+            "attachment; filename*=UTF-8''%00awkward.txt",
+            "https://files.example/%2E%2E%2Foutside.txt",
+            "file",
+        ),
+        (
+            "attachment; filename=..%2Foutside.txt",
+            "https://files.example/report.txt",
+            "..%2Foutside.txt",
+        ),
+    ],
+)
+async def test_download_uses_only_safe_decoded_filename_candidates(
+    content_disposition: str,
+    url: str,
+    expected_filename: str,
+):
+    class Content:
+        async def iter_any(self):
+            yield b"media"
+
+    response = AsyncMock()
+    response.status = 200
+    response.headers = {
+        "Content-Type": "application/octet-stream",
+        "Content-Disposition": content_disposition,
+    }
+    response.content = Content()
+    response.__aenter__ = AsyncMock(return_value=response)
+    response.__aexit__ = AsyncMock(return_value=None)
+    session = MagicMock()
+    session.get.return_value = response
+
+    data, _, filename = await download_file(session, url)
+
+    assert data == b"media"
+    assert filename == expected_filename
+
+class TestPresignedUpload:
     @pytest.mark.asyncio
-    async def test_document_type_sets_attachment_header(self):
-        """Document upload should set attachment Content-Disposition."""
-        mock_session = AsyncMock()
-        mock_response = AsyncMock()
-        mock_response.ok = True
-        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
-        mock_response.__aexit__ = AsyncMock(return_value=None)
-        mock_session.put = MagicMock(return_value=mock_response)
-
-        await upload_file_to_cos(
-            mock_session,
-            credentials={"tmpSecretId": "id", "tmpSecretKey": "key", "sessionToken": "tok"},
-            bucket="test-bucket",
-            region="ap-test",
-            key="uploads/file.xlsx",
-            file_data=b"data",
-            content_type="application/octet-stream",
-            filename="report.xlsx",
+    async def test_get_presign_sends_exact_size_and_normalizes_signed_headers(self):
+        response = AsyncMock()
+        response.ok = True
+        response.status = 200
+        response.json = AsyncMock(
+            return_value={
+                "method": "PUT",
+                "uploadUrl": "https://storage.example/upload?signature=secret",
+                "downloadUrl": "https://cdn.example/report.txt",
+                "contentDisposition": 'attachment; filename="report.txt"',
+            }
         )
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=None)
+        session = MagicMock()
+        session.get.return_value = response
 
-        call_kwargs = mock_session.put.call_args
-        headers = call_kwargs.kwargs.get("headers") or call_kwargs[1].get("headers")
-        assert "Content-Disposition" in headers
-        assert headers["Content-Disposition"] == 'attachment; filename="report.xlsx"'
-
-    @pytest.mark.asyncio
-    async def test_document_type_non_ascii_sets_rfc5987_header(self):
-        """Document upload with Chinese name should use RFC 5987 encoding."""
-        mock_session = AsyncMock()
-        mock_response = AsyncMock()
-        mock_response.ok = True
-        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
-        mock_response.__aexit__ = AsyncMock(return_value=None)
-        mock_session.put = MagicMock(return_value=mock_response)
-
-        await upload_file_to_cos(
-            mock_session,
-            credentials={"tmpSecretId": "id", "tmpSecretKey": "key", "sessionToken": "tok"},
-            bucket="test-bucket",
-            region="ap-test",
-            key="uploads/file.xlsx",
-            file_data=b"data",
-            content_type="application/octet-stream",
-            filename="审查.xlsx",
-        )
-
-        call_kwargs = mock_session.put.call_args
-        headers = call_kwargs.kwargs.get("headers") or call_kwargs[1].get("headers")
-        cd = headers["Content-Disposition"]
-        assert 'filename="download.xlsx"' in cd
-        assert "filename*=UTF-8''" in cd
-        assert "%E5%AE%A1%E6%9F%A5" in cd
-
-    @pytest.mark.asyncio
-    async def test_image_type_no_header(self):
-        """Image upload should NOT set Content-Disposition."""
-        mock_session = AsyncMock()
-        mock_response = AsyncMock()
-        mock_response.ok = True
-        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
-        mock_response.__aexit__ = AsyncMock(return_value=None)
-        mock_session.put = MagicMock(return_value=mock_response)
-
-        await upload_file_to_cos(
-            mock_session,
-            credentials={"tmpSecretId": "id", "tmpSecretKey": "key", "sessionToken": "tok"},
-            bucket="test-bucket",
-            region="ap-test",
-            key="uploads/image.png",
-            file_data=b"data",
-            content_type="image/png",
-            filename="photo.png",
-        )
-
-        call_kwargs = mock_session.put.call_args
-        headers = call_kwargs.kwargs.get("headers") or call_kwargs[1].get("headers")
-        assert "Content-Disposition" not in headers
-
-    @pytest.mark.asyncio
-    async def test_video_type_sets_inline_header(self):
-        """Video upload should set inline Content-Disposition."""
-        mock_session = AsyncMock()
-        mock_response = AsyncMock()
-        mock_response.ok = True
-        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
-        mock_response.__aexit__ = AsyncMock(return_value=None)
-        mock_session.put = MagicMock(return_value=mock_response)
-
-        await upload_file_to_cos(
-            mock_session,
-            credentials={"tmpSecretId": "id", "tmpSecretKey": "key", "sessionToken": "tok"},
-            bucket="test-bucket",
-            region="ap-test",
-            key="uploads/video.mp4",
-            file_data=b"data",
-            content_type="video/mp4",
-            filename="meeting.mp4",
-        )
-
-        call_kwargs = mock_session.put.call_args
-        headers = call_kwargs.kwargs.get("headers") or call_kwargs[1].get("headers")
-        assert headers["Content-Disposition"] == 'inline; filename="meeting.mp4"'
-
-    @pytest.mark.asyncio
-    async def test_audio_type_sets_inline_header(self):
-        """Audio upload should set inline Content-Disposition."""
-        mock_session = AsyncMock()
-        mock_response = AsyncMock()
-        mock_response.ok = True
-        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
-        mock_response.__aexit__ = AsyncMock(return_value=None)
-        mock_session.put = MagicMock(return_value=mock_response)
-
-        await upload_file_to_cos(
-            mock_session,
-            credentials={"tmpSecretId": "id", "tmpSecretKey": "key", "sessionToken": "tok"},
-            bucket="test-bucket",
-            region="ap-test",
-            key="uploads/audio.mp3",
-            file_data=b"data",
-            content_type="audio/mpeg",
-            filename="recording.mp3",
-        )
-
-        call_kwargs = mock_session.put.call_args
-        headers = call_kwargs.kwargs.get("headers") or call_kwargs[1].get("headers")
-        assert headers["Content-Disposition"] == 'inline; filename="recording.mp3"'
-
-    @pytest.mark.asyncio
-    async def test_video_non_ascii_sets_inline_rfc5987(self):
-        """Video with non-ASCII name should use inline with RFC 5987."""
-        mock_session = AsyncMock()
-        mock_response = AsyncMock()
-        mock_response.ok = True
-        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
-        mock_response.__aexit__ = AsyncMock(return_value=None)
-        mock_session.put = MagicMock(return_value=mock_response)
-
-        await upload_file_to_cos(
-            mock_session,
-            credentials={"tmpSecretId": "id", "tmpSecretKey": "key", "sessionToken": "tok"},
-            bucket="test-bucket",
-            region="ap-test",
-            key="uploads/video.mp4",
-            file_data=b"data",
-            content_type="video/mp4",
-            filename="会议录像.mp4",
-        )
-
-        call_kwargs = mock_session.put.call_args
-        headers = call_kwargs.kwargs.get("headers") or call_kwargs[1].get("headers")
-        cd = headers["Content-Disposition"]
-        assert cd.startswith("inline;")
-        assert 'filename="download.mp4"' in cd
-        assert "filename*=UTF-8''" in cd
-
-    @pytest.mark.asyncio
-    async def test_no_filename_no_header(self):
-        """Upload without filename should NOT set Content-Disposition."""
-        mock_session = AsyncMock()
-        mock_response = AsyncMock()
-        mock_response.ok = True
-        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
-        mock_response.__aexit__ = AsyncMock(return_value=None)
-        mock_session.put = MagicMock(return_value=mock_response)
-
-        await upload_file_to_cos(
-            mock_session,
-            credentials={"tmpSecretId": "id", "tmpSecretKey": "key", "sessionToken": "tok"},
-            bucket="test-bucket",
-            region="ap-test",
-            key="uploads/file.txt",
-            file_data=b"data",
+        result = await get_upload_presign(
+            session,
+            "https://api.example",
+            "bot-token",
+            filename="report.txt",
+            file_size=4,
             content_type="text/plain",
         )
 
-        call_kwargs = mock_session.put.call_args
-        headers = call_kwargs.kwargs.get("headers") or call_kwargs[1].get("headers")
-        assert "Content-Disposition" not in headers
+        url = session.get.call_args.args[0]
+        assert "/v1/bot/upload/presigned?" in url
+        assert "filename=report.txt" in url
+        assert "fileSize=4" in url
+        assert "contentType=text%2Fplain" in url
+        assert result == {
+            "uploadUrl": "https://storage.example/upload?signature=secret",
+            "downloadUrl": "https://cdn.example/report.txt",
+            "contentType": "application/octet-stream",
+            "contentDisposition": 'attachment; filename="report.txt"',
+        }
 
     @pytest.mark.asyncio
-    async def test_apostrophe_in_non_ascii_name(self):
-        """Non-ASCII filename with apostrophe should encode apostrophe in filename*."""
-        mock_session = AsyncMock()
-        mock_response = AsyncMock()
-        mock_response.ok = True
-        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
-        mock_response.__aexit__ = AsyncMock(return_value=None)
-        mock_session.put = MagicMock(return_value=mock_response)
+    async def test_get_presign_preserves_backend_signed_headers(self):
+        response = AsyncMock()
+        response.ok = True
+        response.status = 200
+        response.json = AsyncMock(
+            return_value={
+                "method": "PUT",
+                "uploadUrl": "https://storage.example/upload?signature=secret",
+                "downloadUrl": "https://cdn.example/report.txt",
+                "headers": {
+                    "content-type": "text/plain; charset=utf-8",
+                    "x-amz-meta-scope": "octo",
+                },
+            }
+        )
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=None)
+        session = MagicMock()
+        session.get.return_value = response
 
-        await upload_file_to_cos(
-            mock_session,
-            credentials={"tmpSecretId": "id", "tmpSecretKey": "key", "sessionToken": "tok"},
-            bucket="test-bucket",
-            region="ap-test",
-            key="uploads/file.xlsx",
-            file_data=b"data",
-            content_type="application/octet-stream",
-            filename="审查's.xlsx",
+        result = await get_upload_presign(
+            session,
+            "https://api.example",
+            "bot-token",
+            filename="report.txt",
+            file_size=4,
         )
 
-        call_kwargs = mock_session.put.call_args
-        headers = call_kwargs.kwargs.get("headers") or call_kwargs[1].get("headers")
-        cd = headers["Content-Disposition"]
-        assert "%27" in cd  # apostrophe encoded
+        assert result["headers"] == {
+            "content-type": "text/plain; charset=utf-8",
+            "x-amz-meta-scope": "octo",
+        }
+        assert result["contentType"] == "text/plain; charset=utf-8"
+
 
     @pytest.mark.asyncio
-    async def test_pdf_sets_attachment(self):
-        """PDF upload should set attachment Content-Disposition."""
-        mock_session = AsyncMock()
-        mock_response = AsyncMock()
-        mock_response.ok = True
-        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
-        mock_response.__aexit__ = AsyncMock(return_value=None)
-        mock_session.put = MagicMock(return_value=mock_response)
+    async def test_presigned_put_replays_server_headers_and_returns_download_url(self):
+        response = AsyncMock()
+        response.ok = True
+        response.status = 200
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=None)
+        session = MagicMock()
+        guarded_session = MagicMock()
+        guarded_session.put.return_value = response
+        guarded_session.close = AsyncMock()
 
-        await upload_file_to_cos(
-            mock_session,
-            credentials={"tmpSecretId": "id", "tmpSecretKey": "key", "sessionToken": "tok"},
-            bucket="test-bucket",
-            region="ap-test",
-            key="uploads/doc.pdf",
-            file_data=b"data",
-            content_type="application/pdf",
-            filename="report.pdf",
-        )
+        with patch(
+            "hermes_octo_plugin.api.new_guarded_http_session",
+            return_value=guarded_session,
+        ):
+            result = await upload_file_to_presigned_url(
+                upload_url="https://storage.example/upload?signature=secret",
+                download_url="https://cdn.example/report.txt",
+                file_data=b"data",
+                content_type="text/plain; charset=utf-8",
+                content_disposition='attachment; filename="report.txt"',
+            )
 
-        call_kwargs = mock_session.put.call_args
-        headers = call_kwargs.kwargs.get("headers") or call_kwargs[1].get("headers")
-        assert headers["Content-Disposition"] == 'attachment; filename="report.pdf"'
+        assert result == "https://cdn.example/report.txt"
+        assert guarded_session.put.call_args.kwargs["headers"] == {
+            "Content-Type": "text/plain; charset=utf-8",
+            "Content-Length": "4",
+            "Content-Disposition": 'attachment; filename="report.txt"',
+        }
+        guarded_session.close.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_text_sets_attachment(self):
-        """Text file upload should set attachment Content-Disposition."""
-        mock_session = AsyncMock()
-        mock_response = AsyncMock()
-        mock_response.ok = True
-        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
-        mock_response.__aexit__ = AsyncMock(return_value=None)
-        mock_session.put = MagicMock(return_value=mock_response)
+    async def test_presigned_put_replays_arbitrary_server_signed_headers(self):
+        response = AsyncMock()
+        response.ok = True
+        response.status = 200
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=None)
+        session = MagicMock()
+        guarded_session = MagicMock()
+        guarded_session.put.return_value = response
+        guarded_session.close = AsyncMock()
 
-        await upload_file_to_cos(
-            mock_session,
-            credentials={"tmpSecretId": "id", "tmpSecretKey": "key", "sessionToken": "tok"},
-            bucket="test-bucket",
-            region="ap-test",
-            key="uploads/file.txt",
-            file_data=b"data",
+        with patch(
+            "hermes_octo_plugin.api.new_guarded_http_session",
+            return_value=guarded_session,
+        ):
+            await upload_file_to_presigned_url(
+                upload_url="https://storage.example/upload?signature=secret",
+                download_url="https://cdn.example/report.txt",
+                file_data=b"data",
+                content_type="application/octet-stream",
+                headers={
+                    "content-type": "text/plain; charset=utf-8",
+                    "x-amz-meta-scope": "octo",
+                },
+            )
+
+        assert guarded_session.put.call_args.kwargs["headers"] == {
+            "content-type": "text/plain; charset=utf-8",
+            "x-amz-meta-scope": "octo",
+            "Content-Length": "4",
+        }
+        guarded_session.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_presigned_put_rejects_mismatched_signed_content_length(self):
+        session = MagicMock()
+
+        with pytest.raises(ValueError, match="Content-Length"):
+            await upload_file_to_presigned_url(
+                upload_url="https://storage.example/upload?signature=secret",
+                download_url="https://cdn.example/report.txt",
+                file_data=b"data",
+                content_type="application/octet-stream",
+                headers={"Content-Length": "5"},
+            )
+
+        session.put.assert_not_called()
+
+
+    @pytest.mark.asyncio
+    async def test_upload_and_get_url_uses_server_presign_without_cos_credentials(self):
+        presign = {
+            "uploadUrl": "https://storage.example/upload?signature=secret",
+            "downloadUrl": "https://cdn.example/report.txt",
+            "contentType": "text/plain",
+            "contentDisposition": 'attachment; filename="report.txt"',
+        }
+        with (
+            patch(
+                "hermes_octo_plugin.api.get_upload_presign",
+                AsyncMock(return_value=presign),
+            ) as get_presign,
+            patch(
+                "hermes_octo_plugin.api.upload_file_to_presigned_url",
+                AsyncMock(return_value=presign["downloadUrl"]),
+            ) as put_file,
+        ):
+            result = await upload_and_get_url(
+                MagicMock(),
+                "https://api.example",
+                "bot-token",
+                "report.txt",
+                b"data",
+                "text/plain",
+            )
+
+        assert result == presign["downloadUrl"]
+        get_presign.assert_awaited_once_with(
+            get_presign.await_args.args[0],
+            "https://api.example",
+            "bot-token",
+            filename="report.txt",
+            file_size=4,
             content_type="text/plain",
-            filename="notes.txt",
         )
-
-        call_kwargs = mock_session.put.call_args
-        headers = call_kwargs.kwargs.get("headers") or call_kwargs[1].get("headers")
-        assert headers["Content-Disposition"] == 'attachment; filename="notes.txt"'
+        put_file.assert_awaited_once()
 
 
-# ---------------------------------------------------------------------------
-# upload_and_get_url — signature check
-# ---------------------------------------------------------------------------
-class TestUploadAndGetUrlSignature:
-    def test_upload_file_to_cos_has_filename_param(self):
-        """upload_file_to_cos should accept filename parameter."""
-        sig = inspect.signature(upload_file_to_cos)
-        params = list(sig.parameters.keys())
-        assert "filename" in params
+    @pytest.mark.asyncio
+    async def test_private_presigned_origin_is_rejected_without_transport_policy(self):
+        presign = {
+            "uploadUrl": "http://127.0.0.1/upload",
+            "downloadUrl": "https://cdn.example/report.txt",
+            "contentType": "text/plain",
+        }
+        put_file = AsyncMock()
+        with (
+            patch(
+                "hermes_octo_plugin.api.get_upload_presign",
+                AsyncMock(return_value=presign),
+            ),
+            patch(
+                "hermes_octo_plugin.api.upload_file_to_presigned_url",
+                put_file,
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="unsafe presigned upload URL"):
+                await upload_and_get_url(
+                    MagicMock(),
+                    "https://api.example",
+                    "bot-token",
+                    "report.txt",
+                    b"private data",
+                    "text/plain",
+                )
 
-    def test_upload_file_to_cos_no_is_file_type(self):
-        """upload_file_to_cos should not have is_file_type (disposition derived from content_type)."""
-        sig = inspect.signature(upload_file_to_cos)
-        params = list(sig.parameters.keys())
-        assert "is_file_type" not in params
+        put_file.assert_not_awaited()
 
-    def test_upload_and_get_url_no_is_file_type(self):
-        """upload_and_get_url should not have is_file_type (disposition derived from content_type)."""
-        sig = inspect.signature(upload_and_get_url)
-        params = list(sig.parameters.keys())
-        assert "is_file_type" not in params
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "upload_url",
+        [
+            "http://127.0.0.1:9000/upload?X-Amz-Signature=top-secret",
+            "http://10.0.0.8:9000/upload?X-Amz-Signature=top-secret",
+        ],
+    )
+    async def test_private_presign_rejects_unconfigured_origin(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        upload_url: str,
+    ) -> None:
+        monkeypatch.setenv("OCTO_ALLOW_PRIVATE_HOSTS", "true")
+        from hermes_octo_plugin.transport import TransportPolicy
+
+        policy = TransportPolicy({"http://api.internal"})
+        presign = {
+            "uploadUrl": upload_url,
+            "downloadUrl": "https://cdn.example/report.txt",
+            "contentType": "text/plain",
+        }
+        put_file = AsyncMock()
+
+        with (
+            patch(
+                "hermes_octo_plugin.api.get_upload_presign",
+                AsyncMock(return_value=presign),
+            ),
+            patch(
+                "hermes_octo_plugin.api.upload_file_to_presigned_url",
+                put_file,
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="unsafe presigned upload URL"):
+                await upload_and_get_url(
+                    MagicMock(),
+                    "http://api.internal",
+                    "bot-token",
+                    "report.txt",
+                    b"private data",
+                    "text/plain",
+                    policy=policy,
+                )
+
+        assert policy.trusted_download_origins() == frozenset({
+            ("http", "api.internal", 80),
+        })
+        put_file.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unicode_loopback_presign_requires_private_host_opt_in(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("OCTO_ALLOW_PRIVATE_HOSTS", raising=False)
+        from hermes_octo_plugin.transport import TransportPolicy
+
+        upload_url = "http://①②⑦.0.0.1:9000/upload?X-Amz-Signature=top-secret"
+        presign = {
+            "uploadUrl": upload_url,
+            "downloadUrl": "https://cdn.example/report.txt",
+            "contentType": "text/plain",
+        }
+        session = MagicMock()
+        policy = TransportPolicy({"https://api.example"})
+
+        with patch(
+            "hermes_octo_plugin.api.get_upload_presign",
+            AsyncMock(return_value=presign),
+        ):
+            with pytest.raises(RuntimeError, match="unsafe presigned upload URL"):
+                await upload_and_get_url(
+                    session,
+                    "https://api.example",
+                    "bot-token",
+                    "report.txt",
+                    b"private data",
+                    "text/plain",
+                    policy=policy,
+                )
+
+        assert policy.is_download_url_trusted(upload_url) is False
+        session.put.assert_not_called()
+
+
+    @pytest.mark.asyncio
+    async def test_presign_accepts_configured_private_exact_origin(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("OCTO_ALLOW_PRIVATE_HOSTS", raising=False)
+        session = MagicMock()
+        from hermes_octo_plugin.transport import TransportPolicy
+        policy = TransportPolicy({"http://127.0.0.1:9000"})
+        presign = {
+            "uploadUrl": "http://127.0.0.1:9000/upload?signature=secret",
+            "downloadUrl": "http://cdn.example/report.txt",
+            "contentType": "text/plain",
+        }
+
+        async def assert_trusted(**_kwargs):
+            assert policy.trusted_download_origins() == frozenset({
+                ("http", "127.0.0.1", 9000),
+            })
+            assert _kwargs["policy"] is policy
+            return presign["downloadUrl"]
+
+        with (
+            patch(
+                "hermes_octo_plugin.api.get_upload_presign",
+                AsyncMock(return_value=presign),
+            ),
+            patch(
+                "hermes_octo_plugin.api.upload_file_to_presigned_url",
+                side_effect=assert_trusted,
+            ),
+        ):
+            result = await upload_and_get_url(
+                session,
+                "http://127.0.0.1:9000",
+                "bot-token",
+                "report.txt",
+                b"data",
+                "text/plain",
+                policy=policy,
+            )
+
+        assert result == presign["downloadUrl"]
+
+    @pytest.mark.asyncio
+    async def test_presign_rejects_opposite_scheme_on_trusted_endpoint(self) -> None:
+        from hermes_octo_plugin.transport import TransportPolicy
+
+        policy = TransportPolicy({"https://storage.example:8443"})
+        presign = {
+            "uploadUrl": "http://storage.example:8443/upload?signature=secret",
+            "downloadUrl": "https://cdn.example/report.txt",
+            "contentType": "text/plain",
+        }
+        put_file = AsyncMock()
+
+        with (
+            patch(
+                "hermes_octo_plugin.api.get_upload_presign",
+                AsyncMock(return_value=presign),
+            ),
+            patch(
+                "hermes_octo_plugin.api.upload_file_to_presigned_url",
+                put_file,
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="unsafe presigned upload URL"):
+                await upload_and_get_url(
+                    MagicMock(),
+                    "https://api.example",
+                    "bot-token",
+                    "report.txt",
+                    b"data",
+                    "text/plain",
+                    policy=policy,
+                )
+
+        put_file.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_presigned_put_uses_isolated_exact_origin_session(self) -> None:
+        from hermes_octo_plugin.transport import TransportPolicy
+
+        upload_url = "http://127.0.0.1:9000/upload?signature=secret"
+        policy = TransportPolicy({"http://127.0.0.1:9000"})
+        response = AsyncMock()
+        response.ok = True
+        response.status = 200
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=None)
+        main_session = MagicMock()
+        isolated_session = MagicMock()
+        isolated_session.put.return_value = response
+        isolated_session.close = AsyncMock()
+
+        with patch(
+            "hermes_octo_plugin.api.new_guarded_http_session",
+            return_value=isolated_session,
+            create=True,
+        ) as session_factory:
+            result = await upload_file_to_presigned_url(
+                upload_url=upload_url,
+                download_url="http://cdn.example/report.txt",
+                file_data=b"data",
+                content_type="text/plain",
+                policy=policy,
+            )
+
+        assert result == "http://cdn.example/report.txt"
+        session_factory.assert_called_once_with(policy=policy)
+        main_session.put.assert_not_called()
+        isolated_session.put.assert_called_once()
+        isolated_session.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_public_presigned_put_uses_guarded_session(self) -> None:
+        response = AsyncMock()
+        response.status = 200
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=None)
+        session = MagicMock()
+        session.put.return_value = response
+        guarded_session = MagicMock()
+        guarded_session.put.return_value = response
+        guarded_session.close = AsyncMock()
+
+        with patch(
+            "hermes_octo_plugin.api.new_guarded_http_session",
+            return_value=guarded_session,
+        ) as session_factory:
+            result = await upload_file_to_presigned_url(
+                upload_url="https://storage.example/upload?signature=secret",
+                download_url="https://cdn.example/report.txt",
+                file_data=b"data",
+                content_type="text/plain",
+            )
+
+        assert result == "https://cdn.example/report.txt"
+        session_factory.assert_called_once()
+        assert session_factory.call_args.kwargs["policy"].trusted_download_origins() == frozenset()
+        session.put.assert_not_called()
+        guarded_session.put.assert_called_once()
+        guarded_session.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_presign_metadata_upload_origin_is_never_trusted(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("OCTO_ALLOW_PRIVATE_HOSTS", "true")
+        session = MagicMock()
+        from hermes_octo_plugin.transport import TransportPolicy
+
+        policy = TransportPolicy({"http://api.internal"})
+        presign = {
+            "uploadUrl": "http://169.254.169.254/latest/meta-data/",
+            "downloadUrl": "http://cdn.internal/report.txt",
+            "contentType": "text/plain",
+        }
+        with patch(
+            "hermes_octo_plugin.api.get_upload_presign",
+            AsyncMock(return_value=presign),
+        ):
+            with pytest.raises(RuntimeError, match="unsafe presigned upload URL"):
+                await upload_and_get_url(
+                    session,
+                    "http://api.internal",
+                    "bot-token",
+                    "report.txt",
+                    b"data",
+                    "text/plain",
+                    policy=policy,
+                )
+
+        assert policy.trusted_download_origins() == frozenset({
+            ("http", "api.internal", 80),
+        })

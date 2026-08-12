@@ -1,277 +1,403 @@
-"""Unit tests for the cross-segment coalescing streaming model.
+"""Final-only Octo text delivery contracts.
 
-Octo has no real edit-in-place API, so hermes' segment-by-segment
-streaming sends would otherwise produce one bubble per LLM segment —
-broken markdown at segment boundaries. We buffer EVERYTHING for a chat
-across segments and only flush after STREAM_FLUSH_DELAY_S of true idle,
-coalescing the response into one clean bubble.
+Octo's Bot API exposes ``message/edit`` for persisted message-extra updates, but
+that endpoint is not a dependable client-visible text streaming transport.
+Hermes must therefore buffer model deltas and send one authoritative text
+message when the turn completes.
 """
 
 from __future__ import annotations
+from typing import Any, cast
 
-import asyncio
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from hermes_octo_plugin.adapter import (
-    OctoAdapter,
-    STREAM_FLUSH_DELAY_S,
+from hermes_octo_plugin.adapter import MAX_MESSAGE_LENGTH, OctoAdapter
+from hermes_octo_plugin.types import (
+    ChannelType,
+    GroupMember,
+    MentionEntity,
+    SendMessageResult,
 )
-from hermes_octo_plugin.types import ChannelType
 from tests.conftest import make_bare_adapter
 
 
 def _make_adapter() -> OctoAdapter:
-    a = make_bare_adapter()
-    a._http_session = object()  # truthy
-    a._api_url = "https://example.test"
-    a._bot_token = "tok"
-    a.truncate_message = lambda content, max_len: [content]
-    return a
+    adapter = make_bare_adapter()
+    adapter._http_session = cast(Any, object())  # truthy test transport
+    adapter._api_url = "https://example.test"
+    adapter._bot_token = "tok"
+    adapter.truncate_message = (
+        lambda content, max_length=MAX_MESSAGE_LENGTH, len_fn=None: [content]
+    )
+    return adapter
 
 
-# ─── send buffers (cursor or no cursor) ──────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_send_opens_buffer_for_first_segment():
-    a = _make_adapter()
-    a._chat_kind["chatA"] = ChannelType.Group
-
-    with patch("hermes_octo_plugin.adapter.api.send_message", new=AsyncMock(side_effect=AssertionError("no early write"))):
-        r = await a.send("chatA", "查到了 ▉")
-
-    assert r.success
-    state = a._active_streams["chatA"]
-    assert state["current_segment"] == "查到了"
-    assert state["segments"] == []
-    state["flush_task"].cancel()
+def test_octo_disables_gateway_edit_streaming() -> None:
+    """The gateway must choose its send-final-only path for Octo."""
+    assert OctoAdapter.SUPPORTS_MESSAGE_EDITING is False
 
 
 @pytest.mark.asyncio
-async def test_send_with_reply_to_still_buffers():
-    """reply_to MUST NOT bypass the buffer — the consumer's first-frame
-    send always passes _initial_reply_to_id, so a reply_to opt-out would
-    silently defeat coalescing for every streaming response."""
-    a = _make_adapter()
-    a._chat_kind["chatA"] = ChannelType.DM
+async def test_gateway_final_response_does_not_quote_trigger_message() -> None:
+    adapter = _make_adapter()
+    adapter._chat_kind["chatA"] = ChannelType.Group
+    complete = "先执行工具，再给出完整最终答案。"
 
-    with patch("hermes_octo_plugin.adapter.api.send_message", new=AsyncMock(side_effect=AssertionError("no early write"))):
-        r = await a.send("chatA", "hi ▉", reply_to="parent-123")
+    with (
+        patch(
+            "hermes_octo_plugin.adapter.api.send_message",
+            new=AsyncMock(
+                return_value=SendMessageResult(
+                    message_id="server-final",
+                    message_seq=42,
+                )
+            ),
+        ) as send_message,
+        patch(
+            "hermes_octo_plugin.adapter.api.edit_message",
+            new=AsyncMock(),
+        ) as edit_message,
+    ):
+        result = await adapter.send(
+            "chatA",
+            complete,
+            reply_to="inbound-1",
+            metadata={"notify": True},
+        )
 
-    assert r.success
-    assert "chatA" in a._active_streams
-    state = a._active_streams["chatA"]
-    assert state["current_segment"] == "hi"
-    state["flush_task"].cancel()
-
-
-@pytest.mark.asyncio
-async def test_send_with_no_stream_metadata_uses_normal_path():
-    a = _make_adapter()
-    a._chat_kind["chatA"] = ChannelType.DM
-    captured: list = []
-
-    async def fake_msg(_s, _u, _t, *, channel_id, channel_type, content, **kw):
-        captured.append(content)
-
-    with patch("hermes_octo_plugin.adapter.api.send_message", new=fake_msg):
-        await a.send("chatA", "hi", metadata={"no_stream": True})
-
-    assert captured == ["hi"]
-    assert "chatA" not in a._active_streams
-
-
-# ─── second send appends as new segment, doesn't drop prior ─────────────────
-
-
-@pytest.mark.asyncio
-async def test_second_send_closes_prior_segment():
-    """A new send() (e.g. next-segment first-frame) must NOT drop the
-    prior in-progress segment — close it into segments[] first."""
-    a = _make_adapter()
-    a._chat_kind["chatA"] = ChannelType.Group
-
-    with patch("hermes_octo_plugin.adapter.api.send_message", new=AsyncMock(side_effect=AssertionError("no early write"))):
-        await a.send("chatA", "**Headers:** ▉")
-        await a.send("chatA", "- `Authorization: ...` ▉")
-
-    state = a._active_streams["chatA"]
-    assert state["segments"] == ["**Headers:**"]
-    assert state["current_segment"] == "- `Authorization: ...`"
-    state["flush_task"].cancel()
-
-
-# ─── edit_message ────────────────────────────────────────────────────────────
+    assert result.success is True
+    assert result.message_id == "server-final"
+    send_message.assert_awaited_once()
+    send_call = send_message.await_args
+    assert send_call is not None
+    assert send_call.kwargs["content"] == complete
+    assert send_call.kwargs["reply_msg_id"] is None
+    edit_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_edit_message_updates_current_segment():
-    a = _make_adapter()
-    a._chat_kind["chatA"] = ChannelType.Group
+async def test_explicit_reply_still_quotes_target_message() -> None:
+    adapter = _make_adapter()
+    adapter._chat_kind["chatA"] = ChannelType.Group
 
-    with patch("hermes_octo_plugin.adapter.api.send_message", new=AsyncMock(side_effect=AssertionError("no early write"))):
-        r = await a.send("chatA", "查 ▉")
-        await a.edit_message("chatA", r.message_id, "查到了。 ▉")
-        await a.edit_message("chatA", r.message_id, "查到了。最终内容 ▉")
+    with patch(
+        "hermes_octo_plugin.adapter.api.send_message",
+        new=AsyncMock(return_value=SendMessageResult(message_id="server-reply")),
+    ) as send_message:
+        result = await adapter.send("chatA", "明确回复", reply_to="message-42")
 
-    state = a._active_streams["chatA"]
-    assert state["current_segment"] == "查到了。最终内容"
-    assert state["segments"] == []  # nothing finalized yet
-    state["flush_task"].cancel()
-
-
-@pytest.mark.asyncio
-async def test_finalize_closes_current_segment_but_does_not_flush():
-    """finalize=True closes the current segment into segments[] but the
-    actual octo write happens only after STREAM_FLUSH_DELAY_S idle."""
-    a = _make_adapter()
-    a._chat_kind["chatA"] = ChannelType.Group
-
-    with patch("hermes_octo_plugin.adapter.api.send_message", new=AsyncMock(side_effect=AssertionError("no early write"))):
-        r = await a.send("chatA", "seg1 ▉")
-        await a.edit_message("chatA", r.message_id, "seg1 complete", finalize=True)
-
-    state = a._active_streams["chatA"]
-    assert state["segments"] == ["seg1 complete"]
-    assert state["current_segment"] == ""
-    state["flush_task"].cancel()
+    assert result.success is True
+    send_call = send_message.await_args
+    assert send_call is not None
+    assert send_call.kwargs["reply_msg_id"] == "message-42"
 
 
 @pytest.mark.asyncio
-async def test_edit_message_returns_failure_when_no_buffer():
-    a = _make_adapter()
-    r = await a.edit_message("chatA", "buf-???", "anything")
-    assert r.success is False
+async def test_complete_send_uses_fresh_group_roster_for_mentions() -> None:
+    adapter = _make_adapter()
+    adapter._chat_kind["chatA"] = ChannelType.Group
+    adapter._group_member_rosters["chatA"] = {"stale-member": "过期成员"}
+    adapter._group_robot_map["chatA"] = {"stale-member": False}
+    adapter._group_cache_timestamps["chatA"] = 2**63
+    complete = "结果：@[member-1:成员]，尾部完整。"
+    get_members = AsyncMock(
+        return_value=[GroupMember(uid="member-1", name="成员", robot=False)]
+    )
 
+    with (
+        patch(
+            "hermes_octo_plugin.adapter.api.get_group_members",
+            new=get_members,
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.api.send_message",
+            new=AsyncMock(return_value=SendMessageResult(message_id="server-final")),
+        ) as send_message,
+    ):
+        result = await adapter.send("chatA", complete)
 
-# ─── multi-segment coalescing (the main behaviour) ──────────────────────────
+    assert result.success is True
+    get_members.assert_awaited_once_with(
+        adapter._http_session,
+        "https://example.test",
+        "tok",
+        "chatA",
+    )
+    send_call = send_message.await_args
+    assert send_call is not None
+    kwargs = send_call.kwargs
+    assert kwargs["content"] == "结果：@成员，尾部完整。"
+    assert kwargs["mention_uids"] == ["member-1"]
+    entities = cast(list[MentionEntity], kwargs["mention_entities"])
+    assert [(entity.uid, entity.offset, entity.length) for entity in entities] == [
+        ("member-1", 3, 3)
+    ]
 
-
-@pytest.mark.asyncio
-async def test_two_segments_coalesce_into_one_send_normal_call():
-    """The behaviour the buffer exists to provide: a response split across
-    two segments (e.g. by a tool call) lands as ONE octo message, not two.
-    """
-    a = _make_adapter()
-    a._chat_kind["chatA"] = ChannelType.Group
-
-    sent: list = []
-
-    async def fake_msg(_s, _u, _t, *, channel_id, channel_type, content, **kw):
-        sent.append(content)
-
-    # Block the flush task from firing until we say so — real production
-    # uses sleep(3s); a stubbed-out sleep would fire as soon as the test
-    # yields between operations, hiding the coalescing.
-    async def never_sleep(_):
-        await asyncio.Event().wait()  # blocks forever
-
-    with patch("hermes_octo_plugin.adapter.api.send_message", new=fake_msg), \
-         patch("hermes_octo_plugin.adapter.asyncio.sleep", new=never_sleep):
-        # Segment 1 streaming + finalize
-        r1 = await a.send("chatA", "**Headers:** ▉")
-        await a.edit_message("chatA", r1.message_id, "**Headers:**\n```bash", finalize=True)
-
-        # Segment 2 first frame — must JOIN, not start a new bubble.
-        r2 = await a.send("chatA", "curl -X POST ▉")
-        assert r2.message_id == r1.message_id
-
-        await a.edit_message("chatA", r2.message_id, "curl -X POST /v1/bot/register", finalize=True)
-
-        # Manually trigger the flush (production: watchdog after 3s of silence)
-        await a._close_active_stream("chatA")
-
-    # ONE outbound message containing both segments concatenated
-    assert len(sent) == 1
-    assert sent[0] == "**Headers:**\n```bash" + "curl -X POST /v1/bot/register"
 
 
 @pytest.mark.asyncio
-async def test_commentary_coalesces_with_response_if_close_in_time():
-    """One-shot commentary (cursor-free) shares the same buffer when sent
-    inside the coalescing window. Trade-off documented on the class."""
-    a = _make_adapter()
-    a._chat_kind["chatA"] = ChannelType.DM
-    sent: list = []
+async def test_unknown_group_roster_is_fetched_before_sending_mentions() -> None:
+    adapter = _make_adapter()
+    adapter._chat_kind["chatA"] = ChannelType.Group
+    complete = "结果：@[member-1:成员]，尾部完整。"
+    get_members = AsyncMock(
+        return_value=[GroupMember(uid="member-1", name="成员", robot=False)]
+    )
 
-    async def fake_msg(_s, _u, _t, *, channel_id, channel_type, content, **kw):
-        sent.append(content)
+    with (
+        patch(
+            "hermes_octo_plugin.adapter.api.get_group_members",
+            new=get_members,
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.api.send_message",
+            new=AsyncMock(return_value=SendMessageResult(message_id="server-final")),
+        ) as send_message,
+    ):
+        result = await adapter.send("chatA", complete)
 
-    async def never_sleep(_):
-        await asyncio.Event().wait()
-
-    with patch("hermes_octo_plugin.adapter.api.send_message", new=fake_msg), \
-         patch("hermes_octo_plugin.adapter.asyncio.sleep", new=never_sleep):
-        # Tool indicator (no cursor) — opens buffer
-        await a.send("chatA", "📚 skill_view: octo-bot-api")
-        # Response segment within the coalescing window
-        r2 = await a.send("chatA", "查到了 ▉")
-        await a.edit_message("chatA", r2.message_id, "查到了，结果是...", finalize=True)
-        await a._close_active_stream("chatA")
-
-    assert len(sent) == 1
-    assert sent[0] == "📚 skill_view: octo-bot-api" + "查到了，结果是..."
-
-
-# ─── idle flush watchdog actually fires ─────────────────────────────────────
+    assert result.success is True
+    get_members.assert_awaited_once()
+    kwargs = send_message.await_args.kwargs
+    assert kwargs["content"] == "结果：@成员，尾部完整。"
+    assert kwargs["mention_uids"] == ["member-1"]
 
 
 @pytest.mark.asyncio
-async def test_idle_flush_delivers_buffered_content():
-    """When NO further activity arrives, the watchdog flushes after the
-    idle delay. Verified by letting the patched sleep return immediately."""
-    a = _make_adapter()
-    a._chat_kind["chatA"] = ChannelType.DM
-    sent: list = []
+async def test_unknown_group_roster_failure_sends_inert_mention_and_reply() -> None:
+    adapter = _make_adapter()
+    adapter._chat_kind["chatA"] = ChannelType.Group
 
-    async def fake_msg(_s, _u, _t, *, channel_id, channel_type, content, **kw):
-        sent.append(content)
+    with (
+        patch(
+            "hermes_octo_plugin.adapter.api.get_group_members",
+            new=AsyncMock(side_effect=RuntimeError("offline")),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.api.send_message",
+            new=AsyncMock(return_value=SendMessageResult(message_id="server-final")),
+        ) as send_message,
+    ):
+        result = await adapter.send("chatA", "@[member-1:成员]")
 
-    real_sleep = asyncio.sleep
-
-    async def short_sleep(_):
-        await real_sleep(0)
-
-    with patch("hermes_octo_plugin.adapter.api.send_message", new=fake_msg), \
-         patch("hermes_octo_plugin.adapter.asyncio.sleep", new=short_sleep):
-        await a.send("chatA", "abandoned ▉")
-        # Yield several times to let the watchdog fire its (patched) sleep
-        for _ in range(5):
-            await real_sleep(0)
-
-    assert sent == ["abandoned"]
-    assert "chatA" not in a._active_streams
+    assert result.success is True
+    kwargs = send_message.await_args.kwargs
+    assert kwargs["content"] == "@成员"
+    assert kwargs["mention_uids"] == []
+    assert kwargs["mention_entities"] == []
 
 
-# ─── cursor strip helper ────────────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_later_chunk_roster_failure_sends_complete_inert_message() -> None:
+    adapter = _make_adapter()
+    adapter._chat_kind["chatA"] = ChannelType.Group
+    adapter.truncate_message = MagicMock(
+        return_value=["first chunk", "@[member-1:成员]"]
+    )
+
+    with (
+        patch(
+            "hermes_octo_plugin.adapter.api.get_group_members",
+            new=AsyncMock(side_effect=RuntimeError("offline")),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.api.send_message",
+            new=AsyncMock(
+                side_effect=[
+                    SendMessageResult(message_id="server-first"),
+                    SendMessageResult(message_id="server-second"),
+                ]
+            ),
+        ) as send_message,
+    ):
+        result = await adapter.send(
+            "chatA",
+            "first chunk@[member-1:成员]",
+        )
+
+    assert result.success is True
+    assert send_message.await_count == 2
+    first, second = send_message.await_args_list
+    assert first.kwargs["content"] == "first chunk"
+    assert first.kwargs["mention_uids"] is None
+    assert first.kwargs["mention_entities"] is None
+    assert second.kwargs["content"] == "@成员"
+    assert second.kwargs["mention_uids"] == []
+    assert second.kwargs["mention_entities"] == []
 
 
-def test_strip_hermes_cursor_helper():
-    a = _make_adapter()
-    assert a._strip_hermes_cursor("hello ▉") == "hello"
-    assert a._strip_hermes_cursor("hello") == "hello"
-    assert a._strip_hermes_cursor("PO▉ST") == "POST"
-    assert a._strip_hermes_cursor("") == ""
+@pytest.mark.asyncio
+async def test_split_structured_mention_sends_no_raw_fragments() -> None:
+    adapter = _make_adapter()
+    adapter._chat_kind["chatA"] = ChannelType.Group
+    adapter.truncate_message = MagicMock(
+        return_value=["prefix @[member-1", ":成员] suffix"]
+    )
+    get_members = AsyncMock()
+
+    with (
+        patch(
+            "hermes_octo_plugin.adapter.api.get_group_members",
+            new=get_members,
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.api.send_message",
+            new=AsyncMock(),
+        ) as send_message,
+    ):
+        result = await adapter.send(
+            "chatA",
+            "prefix @[member-1:成员] suffix",
+        )
+
+    assert result.success is False
+    assert "mention" in (result.error or "")
+    get_members.assert_not_awaited()
+    send_message.assert_not_awaited()
 
 
-# ─── joined_buffer helper ───────────────────────────────────────────────────
+@pytest.mark.asyncio
+@pytest.mark.parametrize("roster_uid", ["", " ", "/", 123])
+async def test_unusable_group_roster_sends_inert_mention(
+    roster_uid: Any,
+) -> None:
+    adapter = _make_adapter()
+    adapter._chat_kind["chatA"] = ChannelType.Group
+
+    with (
+        patch(
+            "hermes_octo_plugin.adapter.api.get_group_members",
+            new=AsyncMock(
+                return_value=[
+                    GroupMember(uid=roster_uid, name="成员", robot=False)
+                ]
+            ),
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.api.send_message",
+            new=AsyncMock(return_value=SendMessageResult(message_id="server-final")),
+        ) as send_message,
+    ):
+        result = await adapter.send("chatA", "@[member-1:成员]")
+
+    assert result.success is True
+    kwargs = send_message.await_args.kwargs
+    assert kwargs["content"] == "@成员"
+    assert kwargs["mention_uids"] == []
+    assert kwargs["mention_entities"] == []
 
 
-def test_joined_buffer_concatenates_segments_and_current():
-    a = _make_adapter()
-    state = {"segments": ["one", "two"], "current_segment": "three"}
-    assert a._joined_buffer(state) == "onetwothree"
+@pytest.mark.asyncio
+async def test_dm_structured_mention_is_inert_without_roster_lookup() -> None:
+    adapter = _make_adapter()
+    adapter._chat_kind["user-1"] = ChannelType.DM
+    get_members = AsyncMock()
+
+    with (
+        patch(
+            "hermes_octo_plugin.adapter.api.get_group_members",
+            new=get_members,
+        ),
+        patch(
+            "hermes_octo_plugin.adapter.api.send_message",
+            new=AsyncMock(return_value=SendMessageResult(message_id="server-final")),
+        ) as send_message,
+    ):
+        result = await adapter.send("user-1", "@[arbitrary-uid:Alice]")
+
+    assert result.success is True
+    get_members.assert_not_awaited()
+    kwargs = send_message.await_args.kwargs
+    assert kwargs["content"] == "@Alice"
+    assert kwargs["mention_uids"] == []
+    assert kwargs["mention_entities"] == []
+
+@pytest.mark.asyncio
+async def test_send_returns_the_real_server_message_id() -> None:
+    adapter = _make_adapter()
+    adapter._chat_kind["chatA"] = ChannelType.DM
+
+    with patch(
+        "hermes_octo_plugin.adapter.api.send_message",
+        new=AsyncMock(return_value=SendMessageResult(message_id="9223372036854775807")),
+    ):
+        result = await adapter.send("chatA", "完整回答")
+
+    assert result.success is True
+    assert result.message_id == "9223372036854775807"
 
 
-def test_joined_buffer_handles_empty_current():
-    a = _make_adapter()
-    state = {"segments": ["one"], "current_segment": ""}
-    assert a._joined_buffer(state) == "one"
+@pytest.mark.asyncio
+async def test_thread_send_never_mutates_membership_implicitly() -> None:
+    adapter = _make_adapter()
+    thread_id = "group-1____thread-1"
+    adapter._chat_kind[thread_id] = ChannelType.CommunityTopic
+
+    with (
+        patch(
+            "hermes_octo_plugin.adapter.api.send_message",
+            new=AsyncMock(return_value=SendMessageResult(message_id="server-1")),
+        ) as send_message,
+        patch(
+            "hermes_octo_plugin.adapter.api.join_thread",
+            new=AsyncMock(),
+        ) as join_thread,
+    ):
+        result = await adapter.send(thread_id, "hello")
+
+    assert result.success is True
+    join_thread.assert_not_awaited()
+    send_call = send_message.await_args
+    assert send_call is not None
+    assert send_call.kwargs["channel_id"] == thread_id
+    assert send_call.kwargs["channel_type"] == ChannelType.CommunityTopic
 
 
-def test_joined_buffer_handles_empty_state():
-    a = _make_adapter()
-    state = {"segments": [], "current_segment": ""}
-    assert a._joined_buffer(state) == ""
+@pytest.mark.asyncio
+async def test_send_failure_is_reported() -> None:
+    adapter = _make_adapter()
+    adapter._chat_kind["chatA"] = ChannelType.Group
+
+    with patch(
+        "hermes_octo_plugin.adapter.api.send_message",
+        new=AsyncMock(side_effect=RuntimeError("upstream unavailable")),
+    ):
+        result = await adapter.send("chatA", "完整回答")
+
+    assert result.success is False
+    assert "upstream unavailable" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_long_final_response_uses_normal_chunking() -> None:
+    adapter = _make_adapter()
+    adapter._chat_kind["chatA"] = ChannelType.Group
+    adapter.truncate_message = (
+        lambda content, max_length=MAX_MESSAGE_LENGTH, len_fn=None: [
+            "first",
+            "second",
+        ]
+    )
+    send_message = AsyncMock(
+        side_effect=[
+            SendMessageResult(message_id="server-1"),
+            SendMessageResult(message_id="server-2"),
+        ]
+    )
+
+    with patch("hermes_octo_plugin.adapter.api.send_message", new=send_message):
+        result = await adapter.send("chatA", "x" * (MAX_MESSAGE_LENGTH + 1))
+
+    assert [call.kwargs["content"] for call in send_message.await_args_list] == [
+        "first",
+        "second",
+    ]
+    assert result.message_id == "server-2"
+
+
+def test_strip_hermes_cursor_helper() -> None:
+    adapter = _make_adapter()
+    assert adapter._strip_hermes_cursor("hello ▉") == "hello"
+    assert adapter._strip_hermes_cursor("hello") == "hello"
