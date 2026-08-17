@@ -13,9 +13,9 @@ from hermes_octo_plugin.types import ChannelType
 from tests.conftest import make_bare_adapter
 
 
-def _group_recv(payload: bytes) -> SimpleNamespace:
+def _group_recv(payload: bytes, *, message_id: str = "message-1") -> SimpleNamespace:
     return SimpleNamespace(
-        message_id="message-1",
+        message_id=message_id,
         message_seq=1,
         from_uid="human-1",
         channel_id="group-1",
@@ -58,6 +58,45 @@ async def test_non_object_payload_is_ignored(raw: bytes) -> None:
 
     adapter.handle_message.assert_not_awaited()
 
+@pytest.mark.asyncio
+async def test_invalid_websocket_copy_does_not_block_valid_retry() -> None:
+    adapter = _inbound_adapter()
+    raw = b'{"type": 1, "content": "valid retry", "mention": {"uids": ["bot-1"]}}'
+
+    with patch(
+        "hermes_octo_plugin.adapter.aes_decrypt",
+        side_effect=[ValueError("bad frame"), raw],
+    ):
+        await adapter._handle_recv(_group_recv(b"bad"))
+        await adapter._handle_recv(_group_recv(raw))
+
+    adapter.handle_message.assert_awaited_once()
+    assert adapter.handle_message.await_args.args[0].text == "valid retry"
+
+
+@pytest.mark.asyncio
+async def test_failed_bot_event_handling_remains_retryable() -> None:
+    adapter = _inbound_adapter()
+    adapter.handle_message.side_effect = [RuntimeError("temporary"), None]
+    message = {
+        "message_id": "message-1",
+        "message_seq": 1,
+        "from_uid": "human-1",
+        "channel_id": "group-1",
+        "channel_type": 2,
+        "timestamp": 1,
+        "payload": {
+            "type": 1,
+            "content": "valid retry",
+            "mention": {"uids": ["bot-1"]},
+        },
+    }
+
+    with pytest.raises(RuntimeError, match="temporary"):
+        await adapter._handle_bot_event_message(message)
+    assert await adapter._handle_bot_event_message(message) == "ignored"
+    assert adapter.handle_message.await_count == 2
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -96,7 +135,7 @@ async def test_ignore_mention_all_disables_ai_broadcast_but_not_direct_uid():
         side_effect=[ai_broadcast, direct],
     ):
         await adapter._handle_recv(_group_recv(ai_broadcast))
-        await adapter._handle_recv(_group_recv(direct))
+        await adapter._handle_recv(_group_recv(direct, message_id="message-2"))
 
     adapter.handle_message.assert_awaited_once()
     assert adapter.handle_message.await_args.args[0].text == "direct"
@@ -225,3 +264,40 @@ async def test_gif_is_delivered_as_visual_media():
         "https://media.example/animated.gif",
         "image/gif",
     )
+
+@pytest.mark.asyncio
+async def test_pending_clarify_does_not_bypass_required_group_mention():
+    adapter = _inbound_adapter()
+    adapter.config.extra["group_sessions_per_user"] = False
+    raw = b'{"type": 1, "content": "typed clarify answer"}'
+
+    from hermes_octo_plugin.adapter import _octo_platform
+    from gateway.session import SessionSource, build_session_key
+    from tools import clarify_gateway
+
+    source = SessionSource(
+        platform=_octo_platform(),
+        chat_id="group-1",
+        chat_type="group",
+        user_id="human-1",
+        user_name="human-1",
+    )
+    adapter.build_source = MagicMock(return_value=source)
+    session_key = build_session_key(
+        source,
+        group_sessions_per_user=False,
+        thread_sessions_per_user=False,
+    )
+    clarify_gateway.register(
+        "clarify-non-mention",
+        session_key,
+        "Choose",
+        ["A", "B"],
+    )
+    try:
+        with patch("hermes_octo_plugin.adapter.aes_decrypt", return_value=raw):
+            await adapter._handle_recv(_group_recv(raw))
+    finally:
+        clarify_gateway.clear_session(session_key)
+
+    adapter.handle_message.assert_not_awaited()

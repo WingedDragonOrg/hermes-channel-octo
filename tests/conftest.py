@@ -45,6 +45,7 @@ def make_bare_adapter():
         PING_MAX_RETRY,
         UNKNOWN_MESSAGE_TYPE_TELEMETRY_CAP,
     )
+    from gateway.config import PlatformConfig
     from hermes_octo_plugin import cards
     from hermes_octo_plugin.card_events import CardSessionRegistry
 
@@ -75,6 +76,7 @@ def make_bare_adapter():
     a._card_sessions = CardSessionRegistry()
     a._card_profile_cache = cards.CardProfileCache()
     a._native_clarify_enabled = False
+    setattr(a, "_inbound_message_ids", LRUCache(max_size=1000))
     a._unknown_message_type_counts = OrderedDict()
     a._unknown_message_type_log_budget = UNKNOWN_MESSAGE_TYPE_TELEMETRY_CAP
     a._disconnecting = False
@@ -101,6 +103,7 @@ def make_bare_adapter():
     a._command_menu_published_digest = None
     a._command_menu_max_chars_config = 1000
     a._lifecycle_lock = asyncio.Lock()
+    a.config = PlatformConfig(enabled=True, token="test")
     # Identity / config (callers override as needed)
     a._api_url = ""
     a._cdn_url = ""

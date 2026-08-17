@@ -327,6 +327,80 @@ async def test_poller_does_not_ack_unowned_card_actions() -> None:
     assert [call.kwargs["event_id"] for call in ack.await_args_list] == [13, 14, 15]
 
 
+
+
+@pytest.mark.asyncio
+async def test_poller_dispatches_message_events_without_card_parse_rejection(caplog) -> None:
+    cursor = _MemoryCursor(10)
+    session = object()
+    on_message = AsyncMock(return_value="consumed")
+    on_card_action = AsyncMock()
+    message_event = {
+        "event_id": 11,
+        "message": {
+            "message_id": "message-11",
+            "message_seq": 22,
+            "from_uid": "user-1",
+            "channel_id": "group-1",
+            "channel_type": 2,
+            "timestamp": 123,
+            "payload": {"type": 1, "content": "typed answer"},
+        },
+    }
+    with (
+        caplog.at_level(logging.WARNING, logger="hermes_octo_plugin.card_events"),
+        patch.object(card_events.api, "fetch_bot_events", AsyncMock(return_value=[message_event])),
+        patch.object(card_events.api, "ack_bot_event", AsyncMock()) as ack,
+    ):
+        poller = card_events.EventPoller(
+            session=session,
+            api_url="https://api.example.invalid",
+            bot_token="test-token",
+            cursor_store=cursor,
+            on_card_action=on_card_action,
+            on_message=on_message,
+            wait_seconds=0,
+        )
+        await poller.initialize()
+        await poller.poll_once()
+
+    on_message.assert_awaited_once_with(message_event["message"])
+    on_card_action.assert_not_awaited()
+    ack.assert_awaited_once_with(
+        session,
+        "https://api.example.invalid",
+        "test-token",
+        event_id=11,
+    )
+    assert "parse_invalid" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_poller_ignores_unknown_event_without_card_parse_rejection(caplog) -> None:
+    cursor = _MemoryCursor(10)
+    with (
+        caplog.at_level(logging.WARNING, logger="hermes_octo_plugin.card_events"),
+        patch.object(
+            card_events.api,
+            "fetch_bot_events",
+            AsyncMock(return_value=[{"event_id": 11, "event_type": "future_event"}]),
+        ),
+    ):
+        poller = card_events.EventPoller(
+            session=object(),
+            api_url="https://api.example.invalid",
+            bot_token="test-token",
+            cursor_store=cursor,
+            on_card_action=AsyncMock(),
+            on_message=AsyncMock(),
+            wait_seconds=0,
+        )
+        await poller.initialize()
+        await poller.poll_once()
+
+    assert cursor.saved == [11]
+    assert "card action rejected" not in caplog.text
+
 @pytest.mark.asyncio
 async def test_poller_logs_each_parse_rejection_once_without_event_payload_values(
     caplog,

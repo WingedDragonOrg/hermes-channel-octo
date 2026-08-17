@@ -139,7 +139,11 @@ async def dispatch_action(
 
     with clarify_gateway._lock:
         entry = clarify_gateway._entries.get(clarify.clarify_id)
-        if not _entry_matches_session(entry, session, clarify):
+        if (
+            not _entry_matches_session(entry, session, clarify)
+            or getattr(entry, "state", "pending") != "pending"
+            or entry.event.is_set()
+        ):
             return "expired"
 
         if action.action_id == clarify.other_action_id:
@@ -216,6 +220,17 @@ def _delivery_result(result: SendMessageResult) -> SendResult:
     )
 
 
+from .card_tools import TrustedOctoRoute
+
+def _shared_multi_user_session(adapter: Any, route: TrustedOctoRoute) -> bool:
+    extra = getattr(adapter.config, "extra", None) or {}
+    if route.channel_type == ChannelType.Group:
+        return not bool(extra.get("group_sessions_per_user", True))
+    if route.channel_type == ChannelType.CommunityTopic:
+        return not bool(extra.get("thread_sessions_per_user", False))
+    return False
+
+
 async def deliver(
     *,
     adapter: Any,
@@ -250,9 +265,21 @@ async def deliver(
             return await awaitable
 
     def still_pending(entry: object) -> bool:
-        return registered_clarify_entry(clarify_id) is entry
+        current = registered_clarify_entry(clarify_id)
+        return current is entry and getattr(current, "state", "pending") == "pending"
 
     def pending_failure(*, message_id: str | None = None) -> SendResult:
+        if (
+            getattr(entry, "state", "pending") == "answered"
+            or (
+                getattr(getattr(entry, "event", None), "is_set", lambda: False)()
+                and getattr(entry, "response", None) not in {None, ""}
+            )
+        ):
+            # Text already resolved the primitive while card delivery was in
+            # flight. Report success so Hermes proceeds to wait_for_response(),
+            # which returns and cleans the winning answer.
+            return SendResult(success=True, message_id=message_id)
         return SendResult(
             success=False,
             message_id=message_id,
@@ -260,6 +287,8 @@ async def deliver(
         )
 
     def deadline_failure() -> SendResult:
+        if not still_pending(entry):
+            return pending_failure()
         return SendResult(
             success=False,
             error="Octo clarify card delivery timed out",
@@ -301,6 +330,7 @@ async def deliver(
     if len(choices) > 4 or len(set(choices)) != len(choices):
         return await fallback_with_deadline(entry)
     multi_select = bool(getattr(entry, "multi_select", False))
+    shared_multi_user_session = _shared_multi_user_session(adapter, route)
 
     try:
         manifest = adapter._card_profile_cache.get()
@@ -357,9 +387,14 @@ async def deliver(
                 for choice_id, choice in action_choices
             ]
             buttons.append({"id": other_action_id, "label": "其他"})
+        direct_reply_hint = (
+            "群内成员也可以点击或直接发送文字回答。"
+            if shared_multi_user_session
+            else "也可以直接发送文字回答。"
+        )
         rendered = cards.build_interactive_card(
             title="需要确认",
-            text=question,
+            text=f"{question}\n\n{direct_reply_hint}",
             inputs=inputs,
             buttons=buttons,
             binding_id=binding_id,
@@ -403,7 +438,13 @@ async def deliver(
     except asyncio.CancelledError:
         raise
     except Exception as first_error:
-        if not still_pending(entry):
+        if (
+            getattr(entry, "state", "pending") == "answered"
+            or (
+                getattr(getattr(entry, "event", None), "is_set", lambda: False)()
+                and getattr(entry, "response", None) not in {None, ""}
+            )
+        ):
             return pending_failure()
         if not clarify_send_is_retryable(first_error):
             return await fallback_with_deadline(entry)
@@ -424,6 +465,8 @@ async def deliver(
         except asyncio.CancelledError:
             raise
         except Exception as retry_error:
+            if not still_pending(entry):
+                return pending_failure()
             return SendResult(
                 success=False,
                 error="Octo clarify card delivery failed",
@@ -431,6 +474,8 @@ async def deliver(
             )
 
     if result.message_id is None:
+        if not still_pending(entry):
+            return pending_failure()
         return SendResult(
             success=False,
             error="Octo clarify card delivery missing message_id",
@@ -470,6 +515,7 @@ async def deliver(
                     input_id=input_id,
                     confirm_action_id=confirm_action_id,
                     other_action_id=other_action_id,
+                    shared_multi_user_session=shared_multi_user_session,
                 ),
             )
         )
@@ -498,6 +544,8 @@ async def deliver(
             raise
         except Exception:
             pass
+        if not still_pending(entry):
+            return pending_failure(message_id=result.message_id)
         return SendResult(
             success=False,
             message_id=result.message_id,
