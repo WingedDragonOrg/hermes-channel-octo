@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import json
 import uuid
 from collections.abc import Awaitable, Callable
@@ -16,7 +15,6 @@ from . import api, cards
 from .card_sessions import CardSession, ClarifySession
 from .types import CARD_PROFILE_V2, ChannelType, SendMessageResult
 
-logger = logging.getLogger(__name__)
 
 
 

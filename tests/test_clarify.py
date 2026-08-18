@@ -64,8 +64,11 @@ def test_native_clarify_is_disabled_unconditionally() -> None:
 
 
 @pytest.mark.asyncio
-async def test_legacy_clarify_versions_delegate_to_base_text_fallback() -> None:
+async def test_group_clarify_text_fallback_instructs_user_to_mention_bot() -> None:
     adapter = _bare_clarify_adapter(native=False)
+    adapter._require_mention = True
+    adapter._robot_id = "xiaoaitongxue_bot"
+    adapter._uid_to_name[adapter._robot_id] = "小爱"
     expected = SendResult(success=True, message_id="text-1")
     fallback = AsyncMock(return_value=expected)
 
@@ -75,16 +78,16 @@ async def test_legacy_clarify_versions_delegate_to_base_text_fallback() -> None:
             "group-1",
             "Which option?",
             ["A", "B"],
-            clarify_id="clarify-legacy",
+            clarify_id="clarify-text",
             session_key=_ROUTE.session_key,
         )
 
     assert result is expected
     fallback.assert_awaited_once_with(
         "group-1",
-        "Which option?",
+        "Which option?\n\n请在回复时 @小爱，否则群聊消息不会被机器人接收。",
         ["A", "B"],
-        clarify_id="clarify-legacy",
+        clarify_id="clarify-text",
         session_key=_ROUTE.session_key,
         metadata=None,
     )
