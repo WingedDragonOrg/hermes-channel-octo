@@ -786,18 +786,6 @@ class LRUCache:
         while len(self._cache) > self._max_size:
             self._cache.popitem(last=False)
 
-    def set_if_absent(self, key: str, value: str) -> bool:
-        if key in self._cache:
-            self._cache.move_to_end(key)
-            return False
-        self._cache[key] = value
-        while len(self._cache) > self._max_size:
-            self._cache.popitem(last=False)
-        return True
-
-    def pop(self, key: str) -> str | None:
-        return self._cache.pop(key, None)
-
     def __contains__(self, key: str) -> bool:
         return key in self._cache
 
@@ -876,7 +864,6 @@ class OctoAdapter(BasePlatformAdapter):
         self._command_menu_force_pending = False
         self._command_menu_published_digest: str | None = None
         self._lifecycle_lock = asyncio.Lock()
-        self._inbound_message_waiters: dict[str, asyncio.Event] = {}
         self._gateway_loop: asyncio.AbstractEventLoop | None = None
         self._progress_tasks: set[asyncio.Task[Any]] = set()
         from .card_sessions import CardSessionRegistry
@@ -1100,31 +1087,17 @@ class OctoAdapter(BasePlatformAdapter):
 
     def _register_card_session(self, session: CardSession) -> None:
         self._card_sessions.register(session)
-
-    async def _clarify_participant_authorized(
-        self,
-        session: CardSession,
-        uid: str,
-    ) -> bool:
+    async def _clarify_participant_authorized(self, session: CardSession, uid: str) -> bool:
         clarify = session.clarify
         if clarify is None or not clarify.shared_multi_user_session:
             return uid == session.requester_uid
-        authorization_check = getattr(self, "_authorization_check", None)
-        if not callable(authorization_check):
-            return False
-        chat_type = "dm" if session.channel_type == ChannelType.DM else "group"
-        try:
-            if not authorization_check(uid, chat_type, session.chat_id):
-                return False
-        except Exception:
-            return False
         from .permission import check_permission
         result = await check_permission(
             requester_uid=uid,
             channel_id=session.channel_id,
             channel_type=session.channel_type,
             owner_uid=self._owner_uid,
-            fetch_group_members=self._fetch_group_members_for_clarify,
+            fetch_group_members=self._fetch_group_members_for_permission,
         )
         return result.allowed
 
@@ -2574,60 +2547,38 @@ class OctoAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.debug("[%s] RECVACK failed: %s", self.name, redact_log(str(e)))
         message_id = str(recv.message_id)
-        if recv.channel_type == ChannelType.DM:
-            channel_id = (
-                recv.channel_id
-                if _extract_space_id(recv.channel_id) is not None
-                else recv.from_uid
-            )
-            dedup_channel_id = channel_id
-        else:
-            channel_id = recv.channel_id
-            dedup_channel_id = channel_id
-        dedup_key = (
-            f"{int(recv.channel_type)}:{dedup_channel_id}:{message_id}"
-        )
-        if not self._inbound_message_ids.set_if_absent(dedup_key, "in_flight"):
+        dedup_key = f"{int(recv.channel_type)}:{recv.channel_id}:{message_id}"
+        if self._inbound_message_ids.get(dedup_key) is not None:
             return
-        completion = asyncio.Event()
-        self._inbound_message_waiters[dedup_key] = completion
+
+        # Decrypt payload
         try:
             decrypted = aes_decrypt(recv.encrypted_payload, self._aes_key, self._aes_iv)
             raw_payload: object = json.loads(decrypted.decode("utf-8"))
             if not isinstance(raw_payload, dict):
                 raise ValueError("Octo payload must be a JSON object")
-            message = BotMessage(
-                message_id=message_id,
-                message_seq=recv.message_seq,
-                from_uid=recv.from_uid,
-                channel_id=channel_id,
-                channel_type=recv.channel_type,
-                timestamp=recv.timestamp,
-                payload=MessagePayload.from_dict(raw_payload),
-            )
-            await self._handle_message(message)
-        except asyncio.CancelledError:
-            self._inbound_message_ids.pop(dedup_key)
-            raise
+            payload_dict: dict[str, Any] = raw_payload
         except Exception as e:
-            self._inbound_message_ids.pop(dedup_key)
-            if isinstance(e, (ValueError, TypeError, json.JSONDecodeError)):
-                logger.debug(
-                    "[%s] Payload decrypt/parse error: %s",
-                    self.name,
-                    redact_log(str(e)),
-                )
-                return
-            raise
-        else:
-            self._inbound_message_ids.set(dedup_key, "seen")
-        finally:
-            completion.set()
-            self._inbound_message_waiters.pop(dedup_key, None)
+            logger.debug(
+                "[%s] Payload decrypt/parse error: %s", self.name, redact_log(str(e))
+            )
+            return
 
+        message = BotMessage(
+            message_id=recv.message_id,
+            message_seq=recv.message_seq,
+            from_uid=recv.from_uid,
+            channel_id=recv.channel_id,
+            channel_type=recv.channel_type,
+            timestamp=recv.timestamp,
+            payload=MessagePayload.from_dict(payload_dict),
+        )
+        await self._handle_message(message)
+        self._inbound_message_ids.set(dedup_key, "seen")
+        return
     async def _handle_bot_event_message(self, raw: Mapping[str, object]) -> str:
-        """Feed a server message event through the normal inbound pipeline."""
-        raw_message_id = raw.get("message_id")
+        """Feed Bot-event message delivery through the same inbound pipeline."""
+        message_id = raw.get("message_id")
         message_seq = raw.get("message_seq")
         from_uid = raw.get("from_uid")
         channel_id = raw.get("channel_id")
@@ -2635,51 +2586,21 @@ class OctoAdapter(BasePlatformAdapter):
         timestamp = raw.get("timestamp")
         payload = raw.get("payload")
         if (
-            not isinstance(raw_message_id, int)
-            or isinstance(raw_message_id, bool)
+            not isinstance(message_id, str)
             or not isinstance(message_seq, int)
             or isinstance(message_seq, bool)
             or not isinstance(from_uid, str)
-            or not from_uid
+            or not isinstance(channel_id, str)
+            or not isinstance(channel_type, int)
+            or isinstance(channel_type, bool)
             or not isinstance(timestamp, int)
             or isinstance(timestamp, bool)
             or not isinstance(payload, dict)
         ):
             return "ignored"
-        if channel_id is None and channel_type is None:
-            matching_dm_routes = [
-                route
-                for route, target_uid in self._space_dm_targets.items()
-                if target_uid == _extract_base_uid(from_uid)
-            ]
-            if len(matching_dm_routes) > 1:
-                return "ignored"
-            channel_id = matching_dm_routes[0] if matching_dm_routes else from_uid
-            channel_type = int(ChannelType.DM)
-        elif (
-            not isinstance(channel_id, str)
-            or not channel_id
-            or not isinstance(channel_type, int)
-            or isinstance(channel_type, bool)
-        ):
-            return "ignored"
-        if channel_type == ChannelType.DM:
-            if _extract_space_id(channel_id) is None:
-                channel_id = from_uid
-            dedup_channel_id = channel_id
-        else:
-            dedup_channel_id = channel_id
-        message_id = str(raw_message_id)
-        dedup_key = f"{channel_type}:{dedup_channel_id}:{message_id}"
-        if not self._inbound_message_ids.set_if_absent(dedup_key, "in_flight"):
-            completion = self._inbound_message_waiters.get(dedup_key)
-            if completion is not None:
-                await completion.wait()
-                if self._inbound_message_ids.get(dedup_key) is None:
-                    return await self._handle_bot_event_message(raw)
+        dedup_key = f"{channel_type}:{channel_id}:{message_id}"
+        if self._inbound_message_ids.get(dedup_key) is not None:
             return "duplicate"
-        completion = asyncio.Event()
-        self._inbound_message_waiters[dedup_key] = completion
         try:
             message = BotMessage(
                 message_id=message_id,
@@ -2690,22 +2611,20 @@ class OctoAdapter(BasePlatformAdapter):
                 timestamp=timestamp,
                 payload=MessagePayload.from_dict(payload),
             )
-            await self._handle_message(message)
-        except asyncio.CancelledError:
-            self._inbound_message_ids.pop(dedup_key)
-            raise
         except (TypeError, ValueError):
-            self._inbound_message_ids.pop(dedup_key)
             return "ignored"
-        except BaseException:
-            self._inbound_message_ids.pop(dedup_key)
-            raise
-        else:
-            self._inbound_message_ids.set(dedup_key, "seen")
-            return "handled"
-        finally:
-            completion.set()
-            self._inbound_message_waiters.pop(dedup_key, None)
+        await self._handle_message(message)
+        self._inbound_message_ids.set(dedup_key, "seen")
+        try:
+            from tools import clarify_gateway
+
+            return (
+                "consumed"
+                if clarify_gateway.is_clarify_message_consumed(message_id)
+                else "ignored"
+            )
+        except Exception:
+            return "ignored"
 
     async def _handle_message(self, msg: BotMessage) -> None:
         payload = msg.payload
@@ -3135,45 +3054,6 @@ class OctoAdapter(BasePlatformAdapter):
                     pass
 
     # ── Cross-Channel Permission + Read ───────────────────────────────────
-
-    async def _fetch_group_members_for_clarify(
-        self,
-        group_no: str,
-    ) -> list[GroupMember]:
-        """Use a fresh bounded roster for shared clarify authorization."""
-        parent_group_no = group_no.split("____", 1)[0]
-        now = int(time.time() * 1000)
-        last_fetched = self._group_cache_timestamps.get(parent_group_no, 0)
-        cached = self._group_robot_map.get(parent_group_no)
-        if (
-            cached is not None
-            and last_fetched > 0
-            and now - last_fetched <= GROUP_CACHE_EXPIRY_MS
-        ):
-            return [
-                GroupMember(
-                    uid=uid,
-                    name=self._group_member_rosters.get(parent_group_no, {}).get(uid, uid),
-                    robot=robot,
-                )
-                for uid, robot in cached.items()
-            ]
-        if not self._http_session:
-            return []
-        try:
-            members = await api.get_group_members(
-                self._http_session,
-                self._api_url,
-                self._bot_token,
-                parent_group_no,
-            )
-        except Exception:
-            return []
-        if not members:
-            return []
-        self._cache_group_members(parent_group_no, members)
-        self._group_cache_timestamps[parent_group_no] = now
-        return members
 
     async def _fetch_group_members_for_permission(self, group_no: str):
         """Fetcher passed to permission.check_permission.

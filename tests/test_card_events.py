@@ -333,7 +333,7 @@ async def test_poller_does_not_ack_unowned_card_actions() -> None:
 async def test_poller_dispatches_message_events_without_card_parse_rejection(caplog) -> None:
     cursor = _MemoryCursor(10)
     session = object()
-    on_message = AsyncMock(return_value="handled")
+    on_message = AsyncMock(return_value="consumed")
     on_card_action = AsyncMock()
     message_event = {
         "event_id": 11,

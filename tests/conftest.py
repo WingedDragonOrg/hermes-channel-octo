@@ -77,7 +77,6 @@ def make_bare_adapter():
     a._card_profile_cache = cards.CardProfileCache()
     a._native_clarify_enabled = False
     setattr(a, "_inbound_message_ids", LRUCache(max_size=1000))
-    setattr(a, "_inbound_message_waiters", {})
     a._unknown_message_type_counts = OrderedDict()
     a._unknown_message_type_log_budget = UNKNOWN_MESSAGE_TYPE_TELEMETRY_CAP
     a._disconnecting = False

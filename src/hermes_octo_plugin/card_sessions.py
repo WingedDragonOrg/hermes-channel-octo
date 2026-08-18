@@ -25,7 +25,7 @@ def _valid_sequence(value: object) -> bool:
 @dataclass(frozen=True)
 class ClarifySession:
     clarify_id: str
-    occurrence_token: str
+    entry: object
     multi_select: bool
     question: str
     choices: tuple[str, ...]
