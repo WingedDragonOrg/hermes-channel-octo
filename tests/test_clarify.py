@@ -59,66 +59,16 @@ def _card_nodes(value: object, node_type: str) -> list[dict[str, object]]:
     return matches
 
 
-@pytest.mark.parametrize(
-    ("version", "expected"),
-    [
-        ("0.14.9", False),
-        ("0.19.7", False),
-        ("0.20.0", True),
-        ("0.20.4", True),
-        ("0.20.1.dev2", False),
-        ("0.20.4rc1", False),
-        ("0.21.0rc1", False),
-        ("0.21.0.dev1", False),
-        ("0.21.0", False),
-        ("0.22.0", False),
-        ("1.0.0", False),
-        ("not-a-version", False),
-    ],
-)
-def test_constructor_enables_native_clarify_only_for_stable_hermes_020(
-    version: str,
-    expected: bool,
-) -> None:
-    with patch.object(clarify, "package_version", return_value=version):
-        actual = clarify.native_clarify_supported()
-
-    assert actual is expected
-
-
-def test_unstable_native_clarify_gate_logs_its_decision_once(caplog) -> None:
-    version = "0.20.999.dev999"
-    with (
-        patch.object(clarify, "package_version", return_value=version),
-        caplog.at_level("INFO"),
-    ):
-        assert clarify.native_clarify_supported() is False
-        assert clarify.native_clarify_supported() is False
-
-    assert sum(
-        version in record.message and "native clarify disabled" in record.message
-        for record in caplog.records
-    ) == 1
-
-
-def test_missing_packaging_only_disables_native_clarify() -> None:
-    real_import = __import__
-
-    def import_without_packaging(name, *args, **kwargs):
-        if name == "packaging.version":
-            raise ModuleNotFoundError("packaging unavailable")
-        return real_import(name, *args, **kwargs)
-
-    with (
-        patch.object(clarify, "package_version", return_value="0.20.0"),
-        patch("builtins.__import__", side_effect=import_without_packaging),
-    ):
-        assert clarify.native_clarify_supported() is False
+def test_native_clarify_is_disabled_unconditionally() -> None:
+    assert clarify.native_clarify_supported() is False
 
 
 @pytest.mark.asyncio
-async def test_legacy_clarify_versions_delegate_to_base_text_fallback() -> None:
+async def test_group_clarify_text_fallback_instructs_user_to_mention_bot() -> None:
     adapter = _bare_clarify_adapter(native=False)
+    adapter._require_mention = True
+    adapter._robot_id = "xiaoaitongxue_bot"
+    adapter._uid_to_name[adapter._robot_id] = "小爱"
     expected = SendResult(success=True, message_id="text-1")
     fallback = AsyncMock(return_value=expected)
 
@@ -128,16 +78,16 @@ async def test_legacy_clarify_versions_delegate_to_base_text_fallback() -> None:
             "group-1",
             "Which option?",
             ["A", "B"],
-            clarify_id="clarify-legacy",
+            clarify_id="clarify-text",
             session_key=_ROUTE.session_key,
         )
 
     assert result is expected
     fallback.assert_awaited_once_with(
         "group-1",
-        "Which option?",
+        "Which option?\n\n请在回复时 @小爱，否则群聊消息不会被机器人接收。",
         ["A", "B"],
-        clarify_id="clarify-legacy",
+        clarify_id="clarify-text",
         session_key=_ROUTE.session_key,
         metadata=None,
     )

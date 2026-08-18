@@ -20,8 +20,8 @@ Hermes buffers text replies and sends one complete final message.
 
 The plugin is verified against `hermes-agent==0.20.0`; the lower bound remains
 `0.14` for existing installations. Native interactive `send_clarify` cards are
-enabled for Hermes `>=0.20.0`. Hermes `0.14`–`0.19` and unknown/unparseable
-versions retain Hermes' plain-text clarify fallback.
+disabled on every supported Hermes version; clarifies use Hermes' plain-text
+fallback so users are never required to resolve a card action.
 
 All commands below assume `HERMES_HOME` points at the hermes install you
 want to wire the plugin into, and that you invoke the matching `hermes`
@@ -151,18 +151,12 @@ persisted before acknowledgement. These paths are covered by local automated
 tests; production-server card/action/media interoperability still requires the
 separately authorized live acceptance checks.
 
-On stable Hermes 0.20.x only, bounded clarifies with choices use the same
-trusted current-conversation route and Type-17 session binding. Prerelease,
-development, and 0.21+ Hermes versions use the base text fallback. Native
-delivery has one 12-second deadline, waits at most 5 seconds for an active
-progress card's first send, and rechecks the same pending clarify before every
-POST. Single-select prompts render one submit action per choice; multi-select
-prompts render `Input.ChoiceSet` plus Submit; both include an **Other** action
-that switches the existing clarify to Hermes text capture. Choice clicks call
-Hermes' clarify resolution primitive directly and never become a new model turn.
-Card/profile/render failures use the base text fallback. Ambiguous POST failures
-retry once with the same `client_msg_no` and never send a second prompt. This
-version gate is automatic and has no configuration switch.
+Native clarify cards are disabled on every supported Hermes version. Clarify
+prompts use Hermes' base text fallback, and typed replies are resolved by Hermes'
+existing clarify intercept. In groups and topics with `require_mention` enabled,
+the prompt tells the user to mention the bot so Octo dispatches the reply through
+the normal mention gate. Other interactive cards remain governed by the session
+binding and event rules above.
 
 ## Start / Verify
 

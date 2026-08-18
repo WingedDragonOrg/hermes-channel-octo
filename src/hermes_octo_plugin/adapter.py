@@ -3960,6 +3960,16 @@ class OctoAdapter(BasePlatformAdapter):
         session_key: str,
         metadata: dict[str, Any] | None,
     ) -> SendResult:
+        channel_type = self._resolve_channel_type(chat_id)
+        bot_name = self._uid_to_name.get(self._robot_id, "").strip()
+        if (
+            channel_type in _GROUP_CHANNEL_TYPES
+            and self._require_mention
+            and bot_name
+        ):
+            question = (
+                f"{question}\n\n请在回复时 @{bot_name}，否则群聊消息不会被机器人接收。"
+            )
         return await super().send_clarify(
             chat_id,
             question,
