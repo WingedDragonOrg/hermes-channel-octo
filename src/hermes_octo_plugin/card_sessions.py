@@ -33,7 +33,6 @@ class ClarifySession:
     input_id: str | None
     confirm_action_id: str | None
     other_action_id: str
-    shared_multi_user_session: bool = False
 
 
 @dataclass(frozen=True)

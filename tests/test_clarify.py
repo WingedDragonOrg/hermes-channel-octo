@@ -3,7 +3,6 @@
 from __future__ import annotations
 import asyncio
 import threading
-from dataclasses import replace
 
 from unittest.mock import AsyncMock, patch
 
@@ -46,30 +45,6 @@ def _bare_clarify_adapter(*, native: bool) -> OctoAdapter:
     adapter._bot_token = "test-token"
     adapter._on_behalf_of = ""
     return adapter
-
-@pytest.mark.parametrize(
-    ("channel_type", "group_per_user", "thread_per_user", "expected"),
-    [
-        (ChannelType.Group, False, True, True),
-        (ChannelType.Group, True, False, False),
-        (ChannelType.CommunityTopic, False, True, False),
-        (ChannelType.CommunityTopic, True, False, True),
-    ],
-)
-def test_clarify_sharing_uses_the_policy_for_the_route_kind(
-    channel_type: ChannelType,
-    group_per_user: bool,
-    thread_per_user: bool,
-    expected: bool,
-) -> None:
-    route = replace(_ROUTE, channel_type=channel_type)
-    adapter = _bare_clarify_adapter(native=True)
-    adapter.config.extra.update(
-        group_sessions_per_user=group_per_user,
-        thread_sessions_per_user=thread_per_user,
-    )
-
-    assert clarify._shared_multi_user_session(adapter, route) is expected
 
 def _card_nodes(value: object, node_type: str) -> list[dict[str, object]]:
     matches: list[dict[str, object]] = []
@@ -551,11 +526,7 @@ async def test_hermes_020_single_choice_clarify_sends_bound_type17_card() -> Non
     assert all("clarify_id" not in action["data"] for action in actions)
     assert all("session_key" not in action["data"] for action in actions)
     assert all(action["data"]["_octo_binding"] for action in actions)
-    visible_text = "\n".join(
-        node.get("text", "") for node in _card_nodes(card, "TextBlock")
-    )
-    assert "也可以直接发送文字回答" in visible_text
-    assert "也可以直接发送文字回答" in kwargs["plain"]
+
     claimed = adapter._card_sessions.claim("card-message-1", 11)
     assert claimed.status == "claimed"
     assert claimed.session is not None
@@ -565,84 +536,6 @@ async def test_hermes_020_single_choice_clarify_sends_bound_type17_card() -> Non
         ("clarify_choice_0", "A"),
         ("clarify_choice_1", "B"),
     )
-
-@pytest.mark.asyncio
-async def test_text_answer_during_native_delivery_reports_success_to_waiter() -> None:
-    adapter = _bare_clarify_adapter(native=True)
-    clarify_id = "clarify-text-during-delivery"
-    entry = clarify_gateway.register(
-        clarify_id,
-        _ROUTE.session_key,
-        "Which option?",
-        ["A", "B"],
-    )
-
-    async def answer_during_send(*_args, **_kwargs) -> SendMessageResult:
-        assert clarify_gateway.resolve_gateway_clarify(clarify_id, "custom answer")
-        return SendMessageResult(message_id="late-card")
-
-    try:
-        with (
-            patch.object(card_tools, "_trusted_route", return_value=_ROUTE),
-            patch.object(api, "get_card_profile", AsyncMock(return_value=_MANIFEST)),
-            patch.object(
-                api,
-                "send_card_message",
-                AsyncMock(side_effect=answer_during_send),
-            ) as send_card,
-        ):
-            result = await OctoAdapter.send_clarify(
-                adapter,
-                _ROUTE.chat_id,
-                "Which option?",
-                ["A", "B"],
-                clarify_id=clarify_id,
-                session_key=_ROUTE.session_key,
-            )
-        assert result.success is True
-        assert clarify_gateway.wait_for_response(clarify_id, timeout=1) == "custom answer"
-        send_card.assert_awaited_once()
-    finally:
-        clarify_gateway.clear_session(_ROUTE.session_key)
-
-@pytest.mark.asyncio
-async def test_text_answer_wins_when_card_delivery_fails() -> None:
-    adapter = _bare_clarify_adapter(native=True)
-    clarify_id = "clarify-text-before-send-failure"
-    clarify_gateway.register(
-        clarify_id,
-        _ROUTE.session_key,
-        "Which option?",
-        ["A", "B"],
-    )
-
-    async def answer_then_fail(*_args, **_kwargs) -> SendMessageResult:
-        assert clarify_gateway.resolve_gateway_clarify(clarify_id, "custom answer")
-        raise RuntimeError("send failed after answer")
-
-    fallback = AsyncMock(return_value=SendResult(success=False))
-    try:
-        with (
-            patch.object(BasePlatformAdapter, "send_clarify", fallback),
-            patch.object(card_tools, "_trusted_route", return_value=_ROUTE),
-            patch.object(api, "get_card_profile", AsyncMock(return_value=_MANIFEST)),
-            patch.object(api, "send_card_message", side_effect=answer_then_fail),
-        ):
-            result = await OctoAdapter.send_clarify(
-                adapter,
-                _ROUTE.chat_id,
-                "Which option?",
-                ["A", "B"],
-                clarify_id=clarify_id,
-                session_key=_ROUTE.session_key,
-            )
-
-        assert result.success is True
-        assert clarify_gateway.wait_for_response(clarify_id, timeout=1) == "custom answer"
-        fallback.assert_not_awaited()
-    finally:
-        clarify_gateway.clear_session(_ROUTE.session_key)
-
 
 
 @pytest.mark.asyncio
@@ -807,7 +700,6 @@ def _clarify_session(
     clarify_id: str,
     entry: object | None = None,
     multi_select: bool = False,
-    shared_multi_user_session: bool = False,
 ) -> card_events.CardSession:
     clarify = card_events.ClarifySession(
         clarify_id=clarify_id,
@@ -823,7 +715,6 @@ def _clarify_session(
         input_id="clarify_choices" if multi_select else None,
         confirm_action_id="clarify_confirm" if multi_select else None,
         other_action_id="clarify_other",
-        shared_multi_user_session=shared_multi_user_session,
     )
     return card_events.CardSession(
         message_id="card-message",
@@ -868,7 +759,6 @@ def _clarify_action(
     *,
     inputs: dict[str, str] | None = None,
     event_id: int = 17,
-    operator_uid: str = _ROUTE.requester_uid,
 ) -> card_events.CardAction:
     return card_events.CardAction(
         event_id=event_id,
@@ -877,84 +767,9 @@ def _clarify_action(
         channel_type=_ROUTE.channel_type,
         action_id=action_id,
         inputs=inputs or {},
-        operator_uid=operator_uid,
+        operator_uid=_ROUTE.requester_uid,
         data={"_octo_binding": "binding-1"},
     )
-
-
-@pytest.mark.asyncio
-async def test_shared_group_clarify_accepts_another_member_card_action() -> None:
-    registry = card_events.CardSessionRegistry()
-    session = _clarify_session(
-        clarify_id="clarify-shared-member",
-        shared_multi_user_session=True,
-    )
-    registry.register(session)
-
-    status = await card_events.handle_card_action(
-        registry,
-        _clarify_action("clarify_choice_1", operator_uid="member-2"),
-        AsyncMock(return_value="completed"),
-    )
-
-    assert status == "completed"
-
-
-
-
-@pytest.mark.asyncio
-async def test_shared_group_clarify_rejects_unauthorized_member_card_action() -> None:
-    adapter = _bare_clarify_adapter(native=True)
-    adapter._card_sessions.register(
-        _clarify_session(
-            clarify_id="clarify-shared-unauthorized",
-            shared_multi_user_session=True,
-        )
-    )
-
-    status = await adapter._handle_card_action_event(
-        _clarify_action("clarify_choice_1", operator_uid="member-2")
-    )
-
-    assert status == "ignored"
-@pytest.mark.asyncio
-async def test_per_user_group_clarify_rejects_another_member_card_action() -> None:
-    registry = card_events.CardSessionRegistry()
-    session = _clarify_session(clarify_id="clarify-isolated-member")
-    registry.register(session)
-    dispatch = AsyncMock(return_value="completed")
-
-    status = await card_events.handle_card_action(
-        registry,
-        _clarify_action("clarify_choice_1", operator_uid="member-2"),
-        dispatch,
-    )
-
-    assert status == "ignored"
-    dispatch.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_non_clarify_card_keeps_requester_binding() -> None:
-    registry = card_events.CardSessionRegistry()
-    session = replace(
-        _clarify_session(
-            clarify_id="clarify-non-clarify",
-            shared_multi_user_session=True,
-        ),
-        clarify=None,
-    )
-    registry.register(session)
-    dispatch = AsyncMock(return_value="completed")
-
-    status = await card_events.handle_card_action(
-        registry,
-        _clarify_action("clarify_choice_1", operator_uid="member-2"),
-        dispatch,
-    )
-
-    assert status == "ignored"
-    dispatch.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1101,29 +916,6 @@ async def test_stale_clarify_click_is_consumed_as_expired() -> None:
         _clarify_action("clarify_choice_0"),
     )
     assert status == "expired"
-
-@pytest.mark.asyncio
-async def test_click_after_typed_clarify_answer_is_expired_without_overwrite() -> None:
-    clarify_id = "clarify-text-won"
-    entry = clarify_gateway.register(
-        clarify_id,
-        _ROUTE.session_key,
-        "Choose",
-        ["A", "B", "C"],
-    )
-    session = _clarify_session(clarify_id=clarify_id, entry=entry)
-    try:
-        assert clarify_gateway.resolve_gateway_clarify(clarify_id, "custom answer")
-        status = await card_events.dispatch_clarify_action(
-            session,
-            _clarify_action("clarify_choice_0"),
-        )
-        response = entry.response
-    finally:
-        clarify_gateway.clear_session(_ROUTE.session_key)
-
-    assert status == "expired"
-    assert response == "custom answer"
 
 
 @pytest.mark.asyncio

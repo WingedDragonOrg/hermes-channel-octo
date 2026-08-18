@@ -339,19 +339,11 @@ def _action_matches_session(action: CardAction, session: CardSession) -> bool:
         if action.channel_type == ChannelType.DM
         else action.channel_id == session.channel_id
     )
-    requester_matches = (
-        action.operator_uid == session.requester_uid
-        or (
-            session.clarify is not None
-            and session.clarify.shared_multi_user_session
-            and bool(action.operator_uid)
-        )
-    )
     if (
         action.message_id != session.message_id
         or not channel_matches
         or action.channel_type != session.channel_type
-        or not requester_matches
+        or action.operator_uid != session.requester_uid
         or action.action_id not in session.action_labels
         or action.data.get("_octo_binding") != session.binding_id
     ):
@@ -793,7 +785,6 @@ class EventPoller:
         bot_token: str,
         cursor_store: EventCursorStore,
         on_card_action: Callable[[CardAction], Awaitable[str]],
-        on_message: Callable[[Mapping[str, object]], Awaitable[str]] | None = None,
         interval_seconds: float = DEFAULT_EVENT_INTERVAL_SECONDS,
         wait_seconds: int = DEFAULT_EVENT_WAIT_SECONDS,
         limit: int = 50,
@@ -804,7 +795,6 @@ class EventPoller:
         self._bot_token = bot_token
         self._cursor_store = cursor_store
         self._on_card_action = on_card_action
-        self._on_message = on_message
         self._interval_seconds = max(0.5, float(interval_seconds))
         self._wait_seconds = (
             min(MAX_EVENT_WAIT_SECONDS, max(MIN_EVENT_WAIT_SECONDS, int(wait_seconds)))
@@ -963,45 +953,43 @@ class EventPoller:
             ack_failed = False
             for event in ordered:
                 event_id = int(event["event_id"])
-                message = event.get("message")
-                if isinstance(message, Mapping):
-                    status = (
-                        await self._on_message(message)
-                        if self._on_message is not None
-                        else None
+                action = parse_card_action(event)
+                status = (
+                    await self._on_card_action(action)
+                    if action is not None
+                    else None
+                )
+                if action is None:
+                    self._warn_rejection(
+                        event=event,
+                        event_id=event_id,
+                        action=None,
+                        reason="parse_invalid",
                     )
-                    should_ack = status in {"consumed", "duplicate"}
-                else:
-                    action = parse_card_action(event)
-                    status = (
-                        await self._on_card_action(action)
-                        if action is not None
-                        else None
+                elif status in _REJECTION_STATUSES:
+                    self._warn_rejection(
+                        event=event,
+                        event_id=event_id,
+                        action=action,
+                        reason=status,
                     )
-                    if action is None and isinstance(event.get("event_data"), Mapping):
-                        self._warn_rejection(
-                            event=event,
-                            event_id=event_id,
-                            action=None,
-                            reason="parse_invalid",
-                        )
-                    if action is not None and status in _REJECTION_STATUSES:
-                        self._warn_rejection(
-                            event=event,
-                            event_id=event_id,
-                            action=action,
-                            reason=status,
-                        )
-                    should_ack = status in {
-                        "completed",
-                        "awaiting_text",
-                        "expired",
-                        "failed",
-                        "dead_letter",
-                        "invalid",
-                        "duplicate",
-                        "unsupported",
-                    }
+                elif status is None:
+                    self._warn_rejection(
+                        event=event,
+                        event_id=event_id,
+                        action=action,
+                        reason="unhandled",
+                    )
+                should_ack = status in {
+                    "completed",
+                    "awaiting_text",
+                    "expired",
+                    "failed",
+                    "dead_letter",
+                    "invalid",
+                    "duplicate",
+                    "unsupported",
+                }
                 pending_ack_event_id = event_id if should_ack else None
                 await self._cursor_store.save(
                     event_id,

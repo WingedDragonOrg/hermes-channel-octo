@@ -46,6 +46,8 @@ from .mention import (
     strip_leading_self_mention_for_command,
 )
 from .transport import (
+    SSRFGuardConnector as _SSRFGuardConnector,
+    SSRFGuardResolver as _SSRFGuardResolver,
     TransportPolicy as _TransportPolicy,
     _METADATA_HOSTS,
     is_private_or_metadata_host as _is_private_or_metadata_host,
@@ -73,7 +75,6 @@ from .types import (
     BotRegisterResp,
     ChannelType,
     MessagePayload,
-    GroupMember,
     RichTextBlock,
     RICH_TEXT_BLOCK_IMAGE,
     RICH_TEXT_BLOCK_TEXT,
@@ -873,7 +874,6 @@ class OctoAdapter(BasePlatformAdapter):
         self._card_sessions = CardSessionRegistry()
         self._card_profile_cache = cards.CardProfileCache()
         self._native_clarify_enabled = _native_clarify_supported()
-        self._inbound_message_ids = LRUCache(max_size=1000)
 
         # Cache activity tracker: channel_id → last-touched monotonic seconds.
         # _cleanup_caches() uses this to age out stale per-channel state so
@@ -1087,20 +1087,6 @@ class OctoAdapter(BasePlatformAdapter):
 
     def _register_card_session(self, session: CardSession) -> None:
         self._card_sessions.register(session)
-    async def _clarify_participant_authorized(self, session: CardSession, uid: str) -> bool:
-        clarify = session.clarify
-        if clarify is None or not clarify.shared_multi_user_session:
-            return uid == session.requester_uid
-        from .permission import check_permission
-        result = await check_permission(
-            requester_uid=uid,
-            channel_id=session.channel_id,
-            channel_type=session.channel_type,
-            owner_uid=self._owner_uid,
-            fetch_group_members=self._fetch_group_members_for_permission,
-        )
-        return result.allowed
-
 
     async def _handle_card_action_event(self, action: CardAction) -> str:
         from .card_events import (
@@ -1119,18 +1105,6 @@ class OctoAdapter(BasePlatformAdapter):
                     action.action_id,
                 )
             return reasoning_status
-        session = self._card_sessions.peek(action.message_id)
-        if (
-            session is not None
-            and session.clarify is not None
-            and session.clarify.shared_multi_user_session
-            and not await self._clarify_participant_authorized(
-                session,
-                action.operator_uid,
-            )
-        ):
-            return "ignored"
-
 
         async def update_status(
             session: CardSession,
@@ -1194,7 +1168,6 @@ class OctoAdapter(BasePlatformAdapter):
             bot_token=self._bot_token,
             cursor_store=cursor_store,
             on_card_action=self._handle_card_action_event,
-            on_message=self._handle_bot_event_message,
             interval_seconds=self._event_poll_interval_s,
             wait_seconds=self._event_poll_wait_s,
             limit=self._event_poll_limit,
@@ -2537,7 +2510,6 @@ class OctoAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
 
-
     async def _handle_recv(self, recv: Any) -> None:
         # Send RECVACK immediately
         if self._ws:
@@ -2546,10 +2518,6 @@ class OctoAdapter(BasePlatformAdapter):
                 await self._ws.send(ack)
             except Exception as e:
                 logger.debug("[%s] RECVACK failed: %s", self.name, redact_log(str(e)))
-        message_id = str(recv.message_id)
-        dedup_key = f"{int(recv.channel_type)}:{recv.channel_id}:{message_id}"
-        if self._inbound_message_ids.get(dedup_key) is not None:
-            return
 
         # Decrypt payload
         try:
@@ -2564,77 +2532,23 @@ class OctoAdapter(BasePlatformAdapter):
             )
             return
 
-        message = BotMessage(
+        payload: MessagePayload = MessagePayload.from_dict(payload_dict)
+
+        msg = BotMessage(
             message_id=recv.message_id,
             message_seq=recv.message_seq,
             from_uid=recv.from_uid,
             channel_id=recv.channel_id,
             channel_type=recv.channel_type,
             timestamp=recv.timestamp,
-            payload=MessagePayload.from_dict(payload_dict),
+            payload=payload,
         )
-        await self._handle_message(message)
-        self._inbound_message_ids.set(dedup_key, "seen")
-        return
-    async def _handle_bot_event_message(self, raw: Mapping[str, object]) -> str:
-        """Feed Bot-event message delivery through the same inbound pipeline."""
-        message_id = raw.get("message_id")
-        message_seq = raw.get("message_seq")
-        from_uid = raw.get("from_uid")
-        channel_id = raw.get("channel_id")
-        channel_type = raw.get("channel_type")
-        timestamp = raw.get("timestamp")
-        payload = raw.get("payload")
-        if (
-            not isinstance(message_id, str)
-            or not isinstance(message_seq, int)
-            or isinstance(message_seq, bool)
-            or not isinstance(from_uid, str)
-            or not isinstance(channel_id, str)
-            or not isinstance(channel_type, int)
-            or isinstance(channel_type, bool)
-            or not isinstance(timestamp, int)
-            or isinstance(timestamp, bool)
-            or not isinstance(payload, dict)
-        ):
-            return "ignored"
-        dedup_key = f"{channel_type}:{channel_id}:{message_id}"
-        if self._inbound_message_ids.get(dedup_key) is not None:
-            return "duplicate"
-        try:
-            message = BotMessage(
-                message_id=message_id,
-                message_seq=message_seq,
-                from_uid=from_uid,
-                channel_id=channel_id,
-                channel_type=channel_type,
-                timestamp=timestamp,
-                payload=MessagePayload.from_dict(payload),
-            )
-        except (TypeError, ValueError):
-            return "ignored"
-        await self._handle_message(message)
-        self._inbound_message_ids.set(dedup_key, "seen")
-        try:
-            from tools import clarify_gateway
-
-            return (
-                "consumed"
-                if clarify_gateway.is_clarify_message_consumed(message_id)
-                else "ignored"
-            )
-        except Exception:
-            return "ignored"
-
-    async def _handle_message(self, msg: BotMessage) -> None:
-        payload = msg.payload
-
 
         logger.debug(
             "[%s] recv channel_type=%r payload_type=%r "
             "has_content=%s has_media_url=%s has_event=%s",
             self.name,
-            msg.channel_type,
+            recv.channel_type,
             payload.type,
             bool(payload.content or payload.plain or payload.blocks),
             bool(payload.url),
