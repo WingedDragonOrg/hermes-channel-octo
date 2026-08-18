@@ -7,7 +7,6 @@ import logging
 import json
 import uuid
 from collections.abc import Awaitable, Callable
-from importlib.metadata import PackageNotFoundError, version as package_version
 from typing import Any
 
 import aiohttp
@@ -21,47 +20,11 @@ logger = logging.getLogger(__name__)
 
 
 
-_NATIVE_CLARIFY_RELEASE = (0, 20)
-_native_clarify_gate_log: set[tuple[str, bool]] = set()
 
 
 def native_clarify_supported() -> bool:
-    try:
-        from packaging.version import InvalidVersion, Version
-    except ModuleNotFoundError:
-        logger.warning(
-            "[Octo] native clarify disabled: packaging.version is unavailable"
-        )
-        return False
-    try:
-        installed = Version(package_version("hermes-agent"))
-    except PackageNotFoundError:
-        logger.debug(
-            "[Octo] native clarify disabled: hermes-agent distribution not found"
-        )
-        return False
-    except InvalidVersion as exc:
-        logger.warning(
-            "[Octo] native clarify disabled: invalid hermes-agent version",
-            exc_info=exc,
-        )
-        return False
-    enabled = (
-        installed.release[:2] == _NATIVE_CLARIFY_RELEASE
-        and installed.pre is None
-        and installed.dev is None
-        and installed.post is None
-        and installed.local is None
-    )
-    decision = (str(installed), enabled)
-    if decision not in _native_clarify_gate_log:
-        _native_clarify_gate_log.add(decision)
-        logger.info(
-            "[Octo] native clarify %s for hermes-agent %s; requires stable 0.20.x",
-            "enabled" if enabled else "disabled",
-            installed,
-        )
-    return enabled
+    """Disable native clarify cards; Hermes text clarify remains authoritative."""
+    return False
 
 
 def registered_clarify_entry(clarify_id: str) -> Any | None:
