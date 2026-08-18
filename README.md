@@ -151,6 +151,15 @@ persisted before acknowledgement. These paths are covered by local automated
 tests; production-server card/action/media interoperability still requires the
 separately authorized live acceptance checks.
 
+The Bot event stream also carries ordinary inbound messages. Those events and
+WuKongIM WebSocket deliveries share the deduplication key
+`channel_type:channel_id:message_id`; private-message events infer the channel
+from `from_uid` because the server omits channel fields. The first transport
+reserves the key before dispatch, a concurrent copy waits for that attempt, and
+a failed attempt releases the key so the other transport can retry. Fully
+handled and duplicate message events are acknowledged; failed or malformed
+events are not acknowledged.
+
 On stable Hermes 0.20.x only, bounded clarifies with choices use the same
 trusted current-conversation route and Type-17 session binding. Prerelease,
 development, and 0.21+ Hermes versions use the base text fallback. Native

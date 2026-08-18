@@ -3,6 +3,7 @@
 from __future__ import annotations
 import asyncio
 import threading
+import time
 from dataclasses import replace
 
 from unittest.mock import AsyncMock, patch
@@ -11,11 +12,15 @@ import pytest
 
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from tools import clarify_gateway
-
-from hermes_octo_plugin import api, card_events, card_progress, card_tools, clarify
+from hermes_octo_plugin import api, card_events, card_progress, card_tools, cards, clarify
 from hermes_octo_plugin.adapter import OctoAdapter
 from hermes_octo_plugin.card_tools import TrustedOctoRoute
-from hermes_octo_plugin.types import CardProfileManifest, ChannelType, SendMessageResult
+from hermes_octo_plugin.types import (
+    CardProfileManifest,
+    ChannelType,
+    GroupMember,
+    SendMessageResult,
+)
 from tests.conftest import make_bare_adapter
 
 
@@ -70,6 +75,34 @@ def test_clarify_sharing_uses_the_policy_for_the_route_kind(
     )
 
     assert clarify._shared_multi_user_session(adapter, route) is expected
+
+
+@pytest.mark.parametrize(
+    ("channel_type", "require_mention", "shared", "expected"),
+    [
+        (ChannelType.DM, True, False, "也可以直接发送文字回答。"),
+        (ChannelType.Group, False, True, "群内成员可以点击或直接发送文字回答。"),
+        (ChannelType.Group, True, False, "发送文字回答时，请 @机器人。"),
+        (
+            ChannelType.CommunityTopic,
+            True,
+            True,
+            "群内成员可以点击回答；发送文字回答时，请 @机器人。",
+        ),
+    ],
+)
+def test_clarify_reply_hint_matches_effective_mention_policy(
+    channel_type: ChannelType,
+    require_mention: bool,
+    shared: bool,
+    expected: str,
+) -> None:
+    assert clarify._direct_reply_hint(
+        channel_type=channel_type,
+        require_mention=require_mention,
+        shared_multi_user_session=shared,
+    ) == expected
+
 
 def _card_nodes(value: object, node_type: str) -> list[dict[str, object]]:
     matches: list[dict[str, object]] = []
@@ -554,8 +587,8 @@ async def test_hermes_020_single_choice_clarify_sends_bound_type17_card() -> Non
     visible_text = "\n".join(
         node.get("text", "") for node in _card_nodes(card, "TextBlock")
     )
-    assert "也可以直接发送文字回答" in visible_text
-    assert "也可以直接发送文字回答" in kwargs["plain"]
+    assert "发送文字回答时，请 @机器人" in visible_text
+    assert "发送文字回答时，请 @机器人" in kwargs["plain"]
     claimed = adapter._card_sessions.claim("card-message-1", 11)
     assert claimed.status == "claimed"
     assert claimed.session is not None
@@ -809,9 +842,12 @@ def _clarify_session(
     multi_select: bool = False,
     shared_multi_user_session: bool = False,
 ) -> card_events.CardSession:
-    clarify = card_events.ClarifySession(
+    token = str(id(entry)) if entry is not None else clarify_id
+    with clarify._occurrence_lock:
+        clarify._clarify_occurrences[clarify_id] = token
+    clarify_session = card_events.ClarifySession(
         clarify_id=clarify_id,
-        entry=entry if entry is not None else object(),
+        occurrence_token=token,
         multi_select=multi_select,
         question="Choose several" if multi_select else "Choose",
         choices=("A", "B", "C"),
@@ -859,7 +895,7 @@ def _clarify_session(
             "clarify_other": "其他",
         },
         input_ids=("clarify_choices",) if multi_select else (),
-        clarify=clarify,
+        clarify=clarify_session,
     )
 
 
@@ -917,6 +953,77 @@ async def test_shared_group_clarify_rejects_unauthorized_member_card_action() ->
     )
 
     assert status == "ignored"
+
+
+@pytest.mark.asyncio
+async def test_shared_clarify_rejects_member_outside_platform_allowlist() -> None:
+    adapter = _bare_clarify_adapter(native=True)
+    setattr(adapter, "_authorization_check", lambda _uid, _chat_type, _chat_id: False)
+    adapter._card_sessions.register(
+        _clarify_session(
+            clarify_id="clarify-shared-disallowed-user",
+            shared_multi_user_session=True,
+        )
+    )
+
+    with patch.object(api, "get_group_members", AsyncMock()) as fetch:
+        status = await adapter._handle_card_action_event(
+            _clarify_action("clarify_choice_1", operator_uid="member-2")
+        )
+
+    assert status == "ignored"
+    fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_shared_clarify_reuses_fresh_membership_cache() -> None:
+    adapter = _bare_clarify_adapter(native=True)
+    setattr(adapter, "_authorization_check", lambda _uid, _chat_type, _chat_id: True)
+    adapter._cache_group_members(
+        "group-1",
+        [GroupMember(uid="member-2", name="Member 2", robot=False)],
+    )
+    adapter._group_cache_timestamps["group-1"] = int(time.time() * 1000)
+
+    with patch.object(api, "get_group_members", AsyncMock()) as fetch:
+        allowed = await getattr(adapter, "_clarify_participant_authorized")(
+            _clarify_session(
+                clarify_id="clarify-shared-cached-member",
+                shared_multi_user_session=True,
+            ),
+            "member-2",
+        )
+
+    assert allowed is True
+    fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_shared_clarify_does_not_trust_stale_membership_after_refresh_failure() -> None:
+    adapter = _bare_clarify_adapter(native=True)
+    setattr(adapter, "_authorization_check", lambda _uid, _chat_type, _chat_id: True)
+    adapter._cache_group_members(
+        "group-1",
+        [GroupMember(uid="member-2", name="Member 2", robot=False)],
+    )
+    adapter._group_cache_timestamps["group-1"] = 1
+
+    with patch.object(
+        api,
+        "get_group_members",
+        AsyncMock(side_effect=RuntimeError("membership unavailable")),
+    ):
+        allowed = await getattr(adapter, "_clarify_participant_authorized")(
+            _clarify_session(
+                clarify_id="clarify-shared-stale-member",
+                shared_multi_user_session=True,
+            ),
+            "member-2",
+        )
+
+    assert allowed is False
+
+
 @pytest.mark.asyncio
 async def test_per_user_group_clarify_rejects_another_member_card_action() -> None:
     registry = card_events.CardSessionRegistry()
@@ -1144,6 +1251,8 @@ async def test_reused_clarify_id_cannot_resolve_a_same_signature_replacement() -
         "Choose",
         ["A", "B", "C"],
     )
+    with clarify._occurrence_lock:
+        clarify._clarify_occurrences[clarify_id] = "replacement-occurrence"
     replacement.multi_select = False
     try:
         status = await card_events.dispatch_clarify_action(
@@ -1156,6 +1265,44 @@ async def test_reused_clarify_id_cannot_resolve_a_same_signature_replacement() -
 
     assert status == "expired"
     assert response is None
+
+@pytest.mark.asyncio
+async def test_reused_clarify_id_other_action_cannot_mark_replacement() -> None:
+    clarify_id = "clarify-reused-other"
+    original = clarify_gateway.register(
+        clarify_id,
+        _ROUTE.session_key,
+        "Choose",
+        ["A", "B", "C"],
+    )
+    old_card = _clarify_session(clarify_id=clarify_id, entry=original)
+    clarify_gateway.clear_session(_ROUTE.session_key)
+    replacement = clarify_gateway.register(
+        clarify_id,
+        _ROUTE.session_key,
+        "Replacement",
+        ["X", "Y"],
+    )
+    stale_token = original.__class__.__name__
+    old_clarify = old_card.clarify
+    assert old_clarify is not None
+    old_card = replace(
+        old_card,
+        clarify=replace(old_clarify, occurrence_token=stale_token),
+    )
+    with clarify._occurrence_lock:
+        clarify._clarify_occurrences[clarify_id] = stale_token
+    try:
+        status = await card_events.dispatch_clarify_action(
+            old_card,
+            _clarify_action("clarify_other"),
+        )
+        awaiting_text = replacement.awaiting_text
+    finally:
+        clarify_gateway.clear_session(_ROUTE.session_key)
+
+    assert status == "expired"
+    assert awaiting_text is False
 
 
 @pytest.mark.asyncio
@@ -1251,7 +1398,7 @@ async def test_reused_clarify_id_cannot_race_between_validation_and_resolution()
     finally:
         clarify_gateway.clear_session(_ROUTE.session_key)
 
-    assert status == "completed"
+    assert status == "expired"
     assert response is None
 
 

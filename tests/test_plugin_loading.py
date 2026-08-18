@@ -263,6 +263,8 @@ def test_resolve_toolset_returns_core_plus_octo_management(monkeypatch):
     # editable / wheel install layouts in test environments).
     captured_platforms: list[dict] = []
     captured_tools: list[dict] = []
+    registry_scope = registry.current_scope_key()
+    previous_tools = {}
 
     class _RealCtx:
         def register_platform(self, **kwargs):
@@ -278,12 +280,18 @@ def test_resolve_toolset_returns_core_plus_octo_management(monkeypatch):
 
         def register_tool(self, **kwargs):
             captured_tools.append(kwargs)
+            name = kwargs["name"]
+            previous_tools.setdefault(
+                name,
+                registry.snapshot_registration(name, scope=registry_scope),
+            )
             registry.register(
-                name=kwargs["name"],
+                name=name,
                 toolset=kwargs["toolset"],
                 schema=kwargs.get("schema"),
                 handler=kwargs.get("handler"),
                 is_async=kwargs.get("is_async", False),
+                scope=registry_scope,
             )
 
         def register_skill(self, **kwargs):
@@ -299,7 +307,7 @@ def test_resolve_toolset_returns_core_plus_octo_management(monkeypatch):
         assert any(p["name"] == "octo" for p in captured_platforms)
         assert any(t["name"] == "octo_management" for t in captured_tools)
         assert platform_registry.is_registered("octo")
-        assert "octo_management" in registry._tools
+        assert registry.get_entry("octo_management") is not None
 
         resolved = set(resolve_toolset("hermes-octo"))
 
@@ -319,8 +327,15 @@ def test_resolve_toolset_returns_core_plus_octo_management(monkeypatch):
             f"toolset='hermes-octo' instead of 'octo' (issue #2)"
         )
     finally:
-        # Clean up so we don't leak global registry state into other tests.
-        registry._tools.pop("octo_management", None)
-        registry._tools.pop("octo_send_display_card", None)
-        registry._tools.pop("octo_send_interactive_card", None)
+        # Restore the active profile overlay through the public registry API;
+        # modern Hermes keeps plugin tools scoped instead of in _tools.
+        for name, previous in previous_tools.items():
+            current = registry.snapshot_registration(name, scope=registry_scope)
+            if current is not None:
+                registry.restore_registration(
+                    name,
+                    current,
+                    previous,
+                    scope=registry_scope,
+                )
         platform_registry._entries.pop("octo", None)

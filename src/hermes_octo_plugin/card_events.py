@@ -970,7 +970,7 @@ class EventPoller:
                         if self._on_message is not None
                         else None
                     )
-                    should_ack = status in {"consumed", "duplicate"}
+                    should_ack = status in {"handled", "consumed", "duplicate"}
                 else:
                     action = parse_card_action(event)
                     status = (
