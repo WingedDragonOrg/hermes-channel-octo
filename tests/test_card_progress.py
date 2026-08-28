@@ -901,9 +901,21 @@ def test_fallback_progress_matches_openclaw_group_window_and_terminal_collapse()
     detail = rendered.card["body"][1]
     assert detail["id"] == "timeline_detail"
     assert detail["isVisible"] is False
-    toggle_json = str(rendered.card["body"][0])
-    assert "收起执行详情" in toggle_json
-    assert "展开执行详情" in toggle_json
+    collapsed = rendered.card["body"][2]
+    assert (collapsed["id"], collapsed["isVisible"]) == ("collapsed_steps", True)
+    assert collapsed["items"][0]["columns"][1]["items"][0]["text"] == (
+        "读取文件 × 12 · 总计 1.2s · 最近：/tmp/13.txt"
+    )
+    collapse, expand = rendered.card["body"][3], rendered.card["body"][4]
+    assert (collapse["id"], collapse["isVisible"]) == ("btn_collapse_trace", False)
+    assert (expand["id"], expand["isVisible"]) == ("btn_expand_trace", True)
+    assert collapse["actions"][0]["title"] == "收起执行详情"
+    assert expand["actions"][0]["targetElements"] == [
+        {"elementId": "timeline_detail", "isVisible": True},
+        {"elementId": "collapsed_steps", "isVisible": False},
+        {"elementId": "btn_collapse_trace", "isVisible": True},
+        {"elementId": "btn_expand_trace", "isVisible": False},
+    ]
 
 
 def test_progress_renderer_uses_reasoning_only_when_public_thought_is_visible() -> None:
@@ -1435,18 +1447,77 @@ def test_reasoning_process_renderer_uses_collapsed_terminal_trace() -> None:
     assert body[1]["isVisible"] is False
     assert body[2]["id"] == "collapsed_panel"
     assert body[2]["isVisible"] is True
-    toggle = body[3]["items"][0]["actions"][0]
-    assert toggle == {
+    collapse, expand = body[3], body[4]
+    assert (collapse["id"], collapse["isVisible"]) == ("btn_collapse_trace", False)
+    assert (expand["id"], expand["isVisible"]) == ("btn_expand_trace", True)
+    assert collapse["actions"][0]["title"] == "收起执行详情"
+    assert expand["actions"][0] == {
         "type": "Action.ToggleVisibility",
-        "id": "reasoning_toggle",
-        "title": "展开/收起执行详情",
-        "targetElements": ["trace_panel", "collapsed_panel"],
+        "id": "trace_expand",
+        "title": "展开执行详情",
+        "targetElements": [
+            {"elementId": "trace_panel", "isVisible": True},
+            {"elementId": "collapsed_panel", "isVisible": False},
+            {"elementId": "btn_collapse_trace", "isVisible": True},
+            {"elementId": "btn_expand_trace", "isVisible": False},
+        ],
     }
+    collapsed_row = body[2]["items"][0]
+    assert collapsed_row["columns"][1]["items"][0]["text"] == (
+        "读取文件 · …/src/cards.py · 已完成"
+    )
     assert rendered.plain.startswith("处理进度 · 已完成 · 2.0s · 1 个阶段 · 1 次工具调用")
     assert "Check the implementation." in rendered.plain
     assert "读取文件 · …/src/cards.py · 已完成" in rendered.plain
     assert "✦" not in str(rendered.card)
     assert "Reasoning" not in str(rendered.card)
+
+
+def test_reasoning_process_renderer_marks_the_running_step_and_drops_filler() -> None:
+    rendered = cards.build_reasoning_process_card(
+        phase="thinking",
+        tools=[
+            {
+                "tool_name": "__thinking__",
+                "status": "complete",
+                "thought": "Check the implementation.",
+            },
+            {
+                "tool_name": "read",
+                "status": "complete",
+                "summary": "…/src/cards.py",
+            },
+            {"tool_name": "__thinking__", "status": "complete", "thought": ""},
+            {"tool_name": "bash", "status": "running", "summary": "pytest -q"},
+        ],
+        elapsed_ms=41_200,
+        reasoning_id="session-1:turn-1",
+        capabilities=cards.CardCapabilities(
+            available=True,
+            enabled=True,
+            elements=frozenset({"TextBlock", "Container", "ColumnSet", "ActionSet"}),
+            actions=frozenset({"Action.ToggleVisibility"}),
+        ),
+    )
+
+    header, trace = rendered.card["body"][0], rendered.card["body"][1]
+    meta = header["items"][0]["columns"][0]["items"][1]
+    assert meta["text"] == "41.2s · 2 个阶段 · 2 次工具调用"
+    assert trace["isVisible"] is True
+    live = trace["items"][-1]["items"][-1]
+    assert live["style"] == "emphasis"
+    assert live["bleed"] is True
+    assert live["items"][0]["columns"][1]["items"][0]["color"] == "Accent"
+    # A finished step keeps a quiet dot, and its bare "已完成" line is dropped.
+    done_row = trace["items"][0]["items"][1]
+    assert done_row["columns"][0]["items"][0]["isSubtle"] is True
+    assert "color" not in done_row["columns"][0]["items"][0]
+    assert len(done_row["columns"][1]["items"]) == 2
+    card_text = str(rendered.card)
+    assert "正在分析…" not in card_text
+    assert card_text.count("正在处理…") == 0
+    assert rendered.plain.startswith("处理进度 · 进行中 · 41.2s · 2 个阶段 · 2 次工具调用")
+    assert "正在分析…" not in rendered.plain
 
 
 def test_reasoning_summary_preserves_public_thought_but_not_raw_tool_output() -> None:
