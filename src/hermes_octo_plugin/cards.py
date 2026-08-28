@@ -2457,6 +2457,15 @@ def _reasoning_summary_row(
     )
 
 
+def _phase_speaks(phase: Mapping[str, object]) -> bool:
+    """The placeholder thought repeats once per phase and says less than the
+    actions below it, so a phase only opens a new beat when it really spoke."""
+    raw_actions = phase["actions"]
+    assert isinstance(raw_actions, list)
+    actions = [action for action in raw_actions if isinstance(action, Mapping)]
+    return not actions or str(phase["thought"]) != _REASONING_FALLBACK_THOUGHT
+
+
 def _reasoning_phase_block(
     phase: Mapping[str, object],
     *,
@@ -2469,20 +2478,21 @@ def _reasoning_phase_block(
     assert isinstance(raw_actions, list)
     actions = [action for action in raw_actions if isinstance(action, Mapping)]
     thought = str(phase["thought"])
-    # The placeholder thought repeats once per phase and says less than the
-    # actions below it, so a phase only opens a new beat when it really spoke.
-    speaks = not actions or thought != _REASONING_FALLBACK_THOUGHT
+    speaks = _phase_speaks(phase)
     items: list[dict[str, object]] = (
         [_reasoning_text_block(thought, spacing="None")]
         if speaks
         else []
     )
+    # A container never draws spacing on its own first element, so when rows
+    # open the panel their lead air is inert and the panel carries it instead.
+    hoisted = first and not speaks
     items.extend(
         _reasoning_action_row(
             action,
             # The rail stops only where the trace itself stops.
             last=tail and index == len(actions) - 1,
-            lead=index == 0,
+            lead=index == 0 and not hoisted,
             live=live and index == len(actions) - 1,
             rich=rich,
         )
@@ -2592,6 +2602,9 @@ def build_reasoning_process_card(
         )
         for index, item in enumerate(phases)
     ]
+    # A thought line opens the panel with its own air; rows do not, so the
+    # panel hands the lead row the beat its own spacing cannot draw.
+    trace_lead = "Small" if phases and _phase_speaks(phases[0]) else "Medium"
     if progress_text:
         trace_items.append(
             _reasoning_summary_row(
@@ -2686,14 +2699,14 @@ def build_reasoning_process_card(
             "type": "Container",
             "id": "trace_panel",
             "isVisible": trace_visible,
-            "spacing": "Small",
+            "spacing": trace_lead,
             "items": trace_items,
         },
         {
             "type": "Container",
             "id": "collapsed_panel",
             "isVisible": can_toggle and bool(data["traceCollapsed"]),
-            "spacing": "Small",
+            "spacing": "Medium",
             "items": [collapsed_row],
         },
     ]
@@ -3026,10 +3039,14 @@ def build_progress_card(
                 spacing="None",
             )
         )
+    # The hidden-step notice opens the panel with its own line; without it the
+    # rows lead, and a container draws no spacing on its first element, so the
+    # panel below carries that air instead.
+    hoisted = not hidden
     trace_items.extend(
         _reasoning_action_row(
             step,
-            lead=index == 0,
+            lead=index == 0 and not hoisted,
             last=index == len(steps) - 1,
             live=(
                 index == len(steps) - 1
@@ -3069,7 +3086,7 @@ def build_progress_card(
                 "type": "Container",
                 "id": "timeline_detail",
                 "isVisible": detail_visible,
-                "spacing": "Small",
+                "spacing": "Small" if hidden or not steps else "Medium",
                 "items": trace_items,
             },
             *(
@@ -3078,7 +3095,7 @@ def build_progress_card(
                         "type": "Container",
                         "id": "collapsed_steps",
                         "isVisible": True,
-                        "spacing": "Small",
+                        "spacing": "Medium",
                         "items": collapsed_items,
                     }
                 ]

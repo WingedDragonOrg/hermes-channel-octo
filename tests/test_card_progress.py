@@ -901,6 +901,10 @@ def test_fallback_progress_matches_openclaw_group_window_and_terminal_collapse()
     detail = rendered.card["body"][1]
     assert detail["id"] == "timeline_detail"
     assert detail["isVisible"] is False
+    # The hidden-step notice opens the panel, so it keeps the small lead.
+    assert detail["spacing"] == "Small"
+    assert detail["items"][0]["text"] == "已隐藏前 2 个步骤"
+    assert detail["items"][1]["spacing"] == "Medium"
     collapsed = rendered.card["body"][2]
     assert (collapsed["id"], collapsed["isVisible"]) == ("collapsed_steps", True)
     summary = collapsed["items"][0]["columns"][1]["items"][0]
@@ -1574,6 +1578,67 @@ def test_reasoning_process_renderer_marks_the_running_step_and_drops_filler() ->
     assert card_text.count("正在处理…") == 0
     assert rendered.plain.startswith("处理进度 · 进行中 · 41.2s · 2 个阶段 · 2 次工具调用")
     assert "正在分析…" not in rendered.plain
+
+
+def test_trace_panels_carry_the_lead_air_a_first_row_cannot_draw() -> None:
+    # A container never draws spacing on its own first element, so a trace that
+    # opens with a step would otherwise sit flush under the header.
+    caps = cards.CardCapabilities(
+        available=True,
+        enabled=True,
+        elements=frozenset(
+            {"TextBlock", "Container", "ColumnSet", "ActionSet", "RichTextBlock"}
+        ),
+        actions=frozenset({"Action.ToggleVisibility"}),
+    )
+    rows_first = cards.build_reasoning_process_card(
+        phase="completed",
+        tools=[
+            {"tool_name": "bash", "status": "complete", "summary": "python3"},
+            {"tool_name": "read", "status": "complete", "summary": "…/src/cards.py"},
+        ],
+        elapsed_ms=39_700,
+        capabilities=caps,
+    )
+    trace, collapsed = rows_first.card["body"][1], rows_first.card["body"][2]
+    assert (trace["id"], collapsed["id"]) == ("trace_panel", "collapsed_panel")
+    assert trace["spacing"] == "Medium"
+    lead_row = trace["items"][0]["items"][0]
+    assert lead_row["type"] == "ColumnSet"
+    # The panel already drew that beat; asking twice would double the gap.
+    assert lead_row["spacing"] == "None"
+    assert collapsed["spacing"] == "Medium"
+
+    thought_first = cards.build_reasoning_process_card(
+        phase="completed",
+        tools=[
+            {"tool_name": "__thinking__", "status": "complete", "thought": "Ship it."},
+            {"tool_name": "bash", "status": "complete", "summary": "python3"},
+        ],
+        elapsed_ms=39_700,
+        capabilities=caps,
+    )
+    spoken = thought_first.card["body"][1]
+    # A thought opens this panel, so the row keeps its own leading beat.
+    assert spoken["spacing"] == "Small"
+    thought, row = spoken["items"][0]["items"][0], spoken["items"][0]["items"][1]
+    assert (thought["type"], row["type"]) == ("TextBlock", "ColumnSet")
+    assert row["spacing"] == "Medium"
+
+    fallback = cards.build_progress_card(
+        phase="completed",
+        tools=[
+            {"tool_name": "bash", "status": "complete", "summary": "python3"},
+            {"tool_name": "read", "status": "complete", "summary": "/tmp/1.txt"},
+        ],
+        elapsed_ms=2_000,
+        capabilities=caps,
+    )
+    detail, folded = fallback.card["body"][1], fallback.card["body"][2]
+    assert (detail["id"], folded["id"]) == ("timeline_detail", "collapsed_steps")
+    assert detail["spacing"] == "Medium"
+    assert detail["items"][0]["spacing"] == "None"
+    assert folded["spacing"] == "Medium"
 
 
 def test_reasoning_summary_preserves_public_thought_but_not_raw_tool_output() -> None:
