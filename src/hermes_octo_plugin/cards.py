@@ -981,7 +981,14 @@ def validate_card_limits(
         raise CardLimitError("card exceeds max_payload_bytes")
 
 
-def _text_element(text: str, *, bold: bool = False) -> dict[str, Any]:
+def _text_element(
+    text: str,
+    *,
+    bold: bool = False,
+    size: str | None = None,
+    subtle: bool = False,
+    spacing: str | None = None,
+) -> dict[str, Any]:
     element: dict[str, Any] = {
         "type": "TextBlock",
         "text": literal_card_text(text),
@@ -989,7 +996,30 @@ def _text_element(text: str, *, bold: bool = False) -> dict[str, Any]:
     }
     if bold:
         element["weight"] = "Bolder"
+    if size is not None:
+        element["size"] = size
+    if subtle:
+        element["isSubtle"] = True
+    if spacing is not None:
+        element["spacing"] = spacing
     return element
+
+
+# Display cards invert the usual chat-bot hierarchy: section labels shrink and
+# grey out so the content they introduce stays the loudest thing on the card.
+def _display_label(text: str, *, spacing: str | None) -> dict[str, Any]:
+    return _text_element(text, bold=True, size="Small", subtle=True, spacing=spacing)
+
+
+# Spacing above a body line, keyed by what precedes it: a label owns the line
+# below it, consecutive body copy stays a paragraph stream, and any other
+# element starts a fresh group.
+_DISPLAY_TEXT_SPACING: dict[str | None, str | None] = {
+    None: None,
+    "label": "Small",
+    "text": None,
+    "group": "Medium",
+}
 
 
 def _block_text(block: Mapping[str, object]) -> str | None:
@@ -1046,17 +1076,43 @@ def build_display_card(
     body: list[dict[str, Any]] = []
     plain_lines: list[str] = []
 
-    def append_text(text: str, *, bold: bool = False) -> None:
+    def append_text(
+        text: str,
+        *,
+        bold: bool = False,
+        size: str | None = None,
+        spacing: str | None = None,
+    ) -> None:
         _require_element(capabilities, "TextBlock")
-        body.append(_text_element(text, bold=bold))
+        body.append(_text_element(text, bold=bold, size=size, spacing=spacing))
         plain_lines.append(text)
+
+    # Vertical space encodes grouping: a label owns the line under it, running
+    # body copy stays a stream, and anything else starts a new group.
+    previous: str | None = None
+
+    def group_spacing() -> str | None:
+        # Leading spacing is inert, so only separate a group from what precedes.
+        return "Medium" if body else None
+
+    def append_label(text: str) -> None:
+        _require_element(capabilities, "TextBlock")
+        body.append(_display_label(text, spacing=group_spacing()))
+        plain_lines.append(text)
+
+    def group_block(element: dict[str, Any]) -> dict[str, Any]:
+        spacing = group_spacing()
+        if spacing is not None:
+            element["spacing"] = spacing
+        return element
 
     if title is not None:
         if not isinstance(title, str):
             raise ValueError("display card title must be a string")
         clean_title = sanitize_visible_text(title)
         if clean_title is not None:
-            append_text(clean_title, bold=True)
+            append_text(clean_title, bold=True, size="Large")
+            previous = "group"
 
     for block in blocks:
         if not isinstance(block, Mapping):
@@ -1065,12 +1121,18 @@ def build_display_card(
         if block_type in {"heading", "text"}:
             text = _block_text(block)
             if text is not None:
-                append_text(text, bold=block_type == "heading")
+                if block_type == "heading":
+                    append_label(text)
+                    previous = "label"
+                else:
+                    append_text(text, spacing=_DISPLAY_TEXT_SPACING[previous])
+                    previous = "text"
             continue
+        previous = "group"
         if block_type == "section":
             section_elements: list[dict[str, Any]] = []
             section_plain: list[str] = []
-            for field, bold in (("title", True), ("text", False)):
+            for field, is_label in (("title", True), ("text", False)):
                 raw = block.get(field)
                 if raw is None:
                     continue
@@ -1079,12 +1141,25 @@ def build_display_card(
                 clean = sanitize_visible_text(raw)
                 if clean is not None:
                     _require_element(capabilities, "TextBlock")
-                    section_elements.append(_text_element(clean, bold=bold))
+                    section_elements.append(
+                        _display_label(
+                            clean,
+                            spacing=None if not section_elements else "Medium",
+                        )
+                        if is_label
+                        else _text_element(
+                            clean,
+                            spacing="Small" if section_elements else None,
+                        )
+                    )
                     section_plain.append(clean)
             if not section_elements:
                 continue
             if capabilities is None or _supports(capabilities.elements, "Container"):
-                body.append({"type": "Container", "items": section_elements})
+                body.append(group_block({
+                    "type": "Container",
+                    "items": section_elements,
+                }))
             else:
                 body.extend(section_elements)
             plain_lines.extend(section_plain)
@@ -1118,7 +1193,10 @@ def build_display_card(
             if not facts:
                 continue
             if capabilities is None or _supports(capabilities.elements, "FactSet"):
-                body.append({"type": "FactSet", "facts": facts})
+                body.append(group_block({
+                    "type": "FactSet",
+                    "facts": facts,
+                }))
             else:
                 _require_element(capabilities, "TextBlock")
                 body.extend(_text_element(line) for line in lines)
@@ -1137,11 +1215,11 @@ def build_display_card(
                 raise ValueError("display image URL must be a safe http URL")
             line = f"{clean_alt}: {origin}"
             if capabilities is None or _supports(capabilities.elements, "Image"):
-                body.append({
+                body.append(group_block({
                     "type": "Image",
                     "url": resource_url,
                     "altText": literal_card_text(clean_alt),
-                })
+                }))
             else:
                 _require_element(capabilities, "TextBlock")
                 body.append(_text_element(line))
@@ -1184,7 +1262,10 @@ def build_display_card(
                 or _supports(capabilities.actions, "Action.OpenUrl")
             )
             if can_render_actions:
-                body.append({"type": "ActionSet", "actions": actions})
+                body.append(group_block({
+                    "type": "ActionSet",
+                    "actions": actions,
+                }))
             else:
                 _require_element(capabilities, "TextBlock")
                 body.extend(_text_element(line) for line in lines)
@@ -2132,30 +2213,61 @@ def _reasoning_text_block(
     }
 
 
-_TRACE_QUIET_TONE = "Good"
 _TRACE_GLYPH_DETAILS = frozenset({"已完成", "进行中"})
+# Container tints carry the run's own state, so the shaded areas of the card
+# mean something instead of merely being grey furniture.
+_TRACE_TONE_STYLES: dict[str, str] = {
+    "Accent": "accent",
+    "Attention": "attention",
+    "Warning": "warning",
+    "Good": "good",
+}
 
 
-def _trace_glyph_block(glyph: str, tone: str) -> dict[str, object]:
-    """Spend colour on the present and on failures; keep finished work quiet."""
-    accent: dict[str, object] = (
-        {"isSubtle": True} if tone == _TRACE_QUIET_TONE else {"color": tone}
-    )
-    return _reasoning_text_block(glyph, size="Small", spacing="None", **accent)
-
-
-def _trace_live_band(
-    row: Mapping[str, object],
+def _trace_glyph_block(
+    glyph: str,
+    tone: str,
     *,
-    spacing: str,
+    last: bool,
 ) -> dict[str, object]:
-    """The card's one shaded band: what the agent is doing right now."""
+    """Dot plus connector: the rail is drawn in text, so it always renders."""
+    return _reasoning_text_block(
+        glyph if last else f"{glyph}\n│",
+        spacing="None",
+        color=tone,
+    )
+
+
+def _trace_status_chip(
+    label: str,
+    tone: str,
+    *,
+    rich: bool,
+) -> dict[str, object]:
+    """The status reads as a marked tag, not as one more coloured word."""
+    if not rich:
+        return _reasoning_text_block(
+            label,
+            color=tone,
+            weight="Bolder",
+            size="Small",
+            spacing="None",
+            horizontalAlignment="Right",
+        )
     return {
-        "type": "Container",
-        "style": "emphasis",
-        "bleed": True,
-        "spacing": spacing,
-        "items": [row],
+        "type": "RichTextBlock",
+        "spacing": "None",
+        "horizontalAlignment": "Right",
+        "inlines": [
+            {
+                "type": "TextRun",
+                "text": literal_card_text(f" {label} "),
+                "color": tone,
+                "weight": "Bolder",
+                "size": "Small",
+                "highlight": True,
+            }
+        ],
     }
 
 
@@ -2213,57 +2325,111 @@ def _trace_toggle_bar(
     ]
 
 
-def _reasoning_action_row(
-    action: Mapping[str, object],
+def _trace_step_items(
+    name: str,
+    detail: str,
     *,
-    first: bool,
-    live: bool = False,
-) -> dict[str, object]:
-    tone = str(action["statusTone"])
-    spacing = "None" if first else "Small"
-    detail = str(action["detail"])
-    label_items: list[dict[str, object]] = [
-        _reasoning_text_block(
-            str(action["tool"]),
-            weight="Bolder",
-            size="Small",
-            spacing="None",
-            **({"color": tone} if live else {}),
-        )
-    ]
-    if detail not in _TRACE_GLYPH_DETAILS:
-        # The status dot already says "done" or "running"; the line beneath it
-        # is only worth its height when it carries the command, path, or error.
-        label_items.append(
+    tone: str,
+    live: bool,
+    rich: bool,
+) -> list[dict[str, object]]:
+    """One log line: the step reads as a sentence, machine text stays machine."""
+    # The status dot already says "done" or "running"; the detail is only worth
+    # its ink when it carries the command, path, result, or error.
+    body = "" if detail in _TRACE_GLYPH_DETAILS else detail
+    if not rich:
+        items: list[dict[str, object]] = [
             _reasoning_text_block(
-                detail,
-                isSubtle=True,
-                size="Small",
+                name,
+                weight="Bolder",
                 spacing="None",
-                fontType="Monospace",
+                **({"color": tone} if live else {}),
             )
-        )
-    row: dict[str, object] = {
+        ]
+        if body:
+            items.append(
+                _reasoning_text_block(
+                    body,
+                    isSubtle=True,
+                    size="Small",
+                    spacing="None",
+                    fontType="Monospace",
+                )
+            )
+        return items
+    inlines: list[dict[str, object]] = [
+        {
+            "type": "TextRun",
+            "text": literal_card_text(name),
+            "weight": "Bolder",
+            **({"color": tone} if live else {}),
+        }
+    ]
+    if body:
+        inlines.append({
+            "type": "TextRun",
+            "text": literal_card_text(f"  {body}"),
+            "fontType": "Monospace",
+            "size": "Small",
+            "isSubtle": True,
+        })
+    return [
+        {
+            "type": "RichTextBlock",
+            "spacing": "None",
+            "inlines": inlines,
+        }
+    ]
+
+
+def _trace_row(
+    items: list[dict[str, object]],
+    *,
+    glyph: str,
+    tone: str,
+    spacing: str,
+    last: bool,
+) -> dict[str, object]:
+    return {
         "type": "ColumnSet",
-        "spacing": "None" if live else spacing,
+        "spacing": spacing,
         "columns": [
             {
                 "type": "Column",
                 "width": "auto",
-                "items": [
-                    _trace_glyph_block(str(action["statusGlyph"]), tone)
-                ],
+                "items": [_trace_glyph_block(glyph, tone, last=last)],
             },
             {
                 "type": "Column",
                 "width": "stretch",
-                "items": label_items,
+                "items": items,
             },
         ],
     }
-    if not live:
-        return row
-    return _trace_live_band(row, spacing=spacing)
+
+
+def _reasoning_action_row(
+    action: Mapping[str, object],
+    *,
+    last: bool,
+    first: bool = False,
+    live: bool = False,
+    rich: bool = False,
+) -> dict[str, object]:
+    tone = str(action["statusTone"])
+    return _trace_row(
+        _trace_step_items(
+            str(action["tool"]),
+            str(action["detail"]),
+            tone=tone,
+            live=live,
+            rich=rich,
+        ),
+        glyph=str(action["statusGlyph"]),
+        tone=tone,
+        spacing="None" if first else "Small",
+        last=last,
+    )
 
 
 def _reasoning_summary_row(
@@ -2272,44 +2438,24 @@ def _reasoning_summary_row(
     glyph: str,
     tone: str,
     spacing: str,
-    live: bool = False,
+    last: bool = True,
 ) -> dict[str, object]:
-    accent: dict[str, object] = (
-        {"isSubtle": True} if tone == _TRACE_QUIET_TONE else {"color": tone}
+    return _trace_row(
+        [_reasoning_text_block(text, spacing="None", color=tone)],
+        glyph=glyph,
+        tone=tone,
+        spacing=spacing,
+        last=last,
     )
-    row: dict[str, object] = {
-        "type": "ColumnSet",
-        "spacing": "None" if live else spacing,
-        "columns": [
-            {
-                "type": "Column",
-                "width": "auto",
-                "items": [_trace_glyph_block(glyph, tone)],
-            },
-            {
-                "type": "Column",
-                "width": "stretch",
-                "items": [
-                    _reasoning_text_block(
-                        text,
-                        size="Small",
-                        spacing="None",
-                        **accent,
-                    )
-                ],
-            },
-        ],
-    }
-    if not live:
-        return row
-    return _trace_live_band(row, spacing=spacing)
 
 
 def _reasoning_phase_block(
     phase: Mapping[str, object],
     *,
     first: bool,
+    tail: bool,
     live: bool = False,
+    rich: bool = False,
 ) -> dict[str, object]:
     raw_actions = phase["actions"]
     assert isinstance(raw_actions, list)
@@ -2319,15 +2465,18 @@ def _reasoning_phase_block(
     # actions below it, so a phase only opens a new beat when it really spoke.
     speaks = not actions or thought != _REASONING_FALLBACK_THOUGHT
     items: list[dict[str, object]] = (
-        [_reasoning_text_block(thought, size="Small", spacing="None")]
+        [_reasoning_text_block(thought, spacing="None")]
         if speaks
         else []
     )
     items.extend(
         _reasoning_action_row(
             action,
+            # The rail runs through every step and stops at the last one.
+            last=tail and index == len(actions) - 1,
             first=index == 0 and not items,
             live=live and index == len(actions) - 1,
+            rich=rich,
         )
         for index, action in enumerate(actions)
     )
@@ -2403,6 +2552,7 @@ def build_reasoning_process_card(
         and capabilities.actions is not None
         and "Action.ToggleVisibility" in capabilities.actions
     )
+    rich = capabilities is None or _supports(capabilities.elements, "RichTextBlock")
     trace_visible = bool(data["traceExpanded"]) if can_toggle else True
     meta_text = _reasoning_meta_text(
         data,
@@ -2423,11 +2573,14 @@ def build_reasoning_process_card(
     if running_last and str(data["state"]) == "reasoning":
         # The running step already carries the live line; one is enough.
         progress_text = ""
+    has_tail = bool(progress_text) or bool(data.get("errorMessage"))
     trace_items: list[dict[str, object]] = [
         _reasoning_phase_block(
             item,
             first=index == 0,
+            tail=index == len(phases) - 1 and not has_tail,
             live=running_last and index == len(phases) - 1,
+            rich=rich,
         )
         for index, item in enumerate(phases)
     ]
@@ -2437,8 +2590,8 @@ def build_reasoning_process_card(
                 progress_text,
                 glyph="◉",
                 tone="Accent",
-                spacing="Medium",
-                live=True,
+                spacing="Small",
+                last=not data.get("errorMessage"),
             )
         )
     if data.get("errorMessage"):
@@ -2448,15 +2601,22 @@ def build_reasoning_process_card(
                 str(data["errorMessage"]),
                 glyph="○",
                 tone="Attention",
-                spacing="Medium",
+                spacing="Small",
             )
         )
     collapsed_row = (
-        _reasoning_summary_row(
-            f"{last_action['tool']} · {last_action['detail']}",
+        _trace_row(
+            _trace_step_items(
+                str(last_action["tool"]),
+                str(last_action["detail"]),
+                tone=str(last_action["statusTone"]),
+                live=False,
+                rich=rich,
+            ),
             glyph=str(last_action["statusGlyph"]),
             tone=str(last_action["statusTone"]),
             spacing="None",
+            last=True,
         )
         if last_action is not None
         else _reasoning_summary_row(
@@ -2470,7 +2630,7 @@ def build_reasoning_process_card(
         {
             "type": "Container",
             "id": "octo-execution-trace-header",
-            "style": "emphasis",
+            "style": _TRACE_TONE_STYLES.get(str(data["statusTone"]), "emphasis"),
             "bleed": True,
             "spacing": "None",
             "items": [
@@ -2485,6 +2645,7 @@ def build_reasoning_process_card(
                                 _reasoning_text_block(
                                     str(data["title"]),
                                     weight="Bolder",
+                                    size="Large",
                                     spacing="None",
                                 ),
                                 _reasoning_text_block(
@@ -2500,13 +2661,10 @@ def build_reasoning_process_card(
                             "type": "Column",
                             "width": "auto",
                             "items": [
-                                _reasoning_text_block(
+                                _trace_status_chip(
                                     str(data["statusLabel"]),
-                                    color=data["statusTone"],
-                                    weight="Bolder",
-                                    size="Small",
-                                    spacing="None",
-                                    horizontalAlignment="Right",
+                                    str(data["statusTone"]),
+                                    rich=rich,
                                 )
                             ],
                         },
@@ -2518,14 +2676,14 @@ def build_reasoning_process_card(
             "type": "Container",
             "id": "trace_panel",
             "isVisible": trace_visible,
-            "spacing": "Medium",
+            "spacing": "None",
             "items": trace_items,
         },
         {
             "type": "Container",
             "id": "collapsed_panel",
             "isVisible": can_toggle and bool(data["traceCollapsed"]),
-            "spacing": "Medium",
+            "spacing": "None",
             "items": [collapsed_row],
         },
     ]
@@ -2788,14 +2946,9 @@ def build_progress_card(
     if elapsed:
         summary_parts.append(elapsed)
     summary_text = " · ".join(summary_parts) or "正在准备"
+    rich = _supports(capabilities.elements, "RichTextBlock")
     status_items: list[dict[str, object]] = [
-        _reasoning_text_block(
-            status_label,
-            color=status_tone,
-            weight="Bolder",
-            size="Small",
-            spacing="None",
-        )
+        _trace_status_chip(status_label, status_tone, rich=rich)
     ]
     header_columns: list[dict[str, object]] = [
         {
@@ -2805,6 +2958,7 @@ def build_progress_card(
                 _reasoning_text_block(
                     "处理进度",
                     weight="Bolder",
+                    size="Large",
                     spacing="None",
                 ),
                 _reasoning_text_block(
@@ -2812,6 +2966,7 @@ def build_progress_card(
                     size="Small",
                     isSubtle=True,
                     spacing="Small",
+                    fontType="Monospace",
                 ),
             ],
         },
@@ -2825,11 +2980,18 @@ def build_progress_card(
         []
         if detail_visible or not steps
         else [
-            _reasoning_summary_row(
-                f"{steps[-1]['tool']} · {steps[-1]['detail']}",
+            _trace_row(
+                _trace_step_items(
+                    steps[-1]["tool"],
+                    steps[-1]["detail"],
+                    tone=steps[-1]["statusTone"],
+                    live=False,
+                    rich=rich,
+                ),
                 glyph=steps[-1]["statusGlyph"],
                 tone=steps[-1]["statusTone"],
                 spacing="None",
+                last=True,
             )
         ]
     )
@@ -2857,10 +3019,12 @@ def build_progress_card(
         _reasoning_action_row(
             step,
             first=index == 0 and not hidden,
+            last=index == len(steps) - 1,
             live=(
                 index == len(steps) - 1
                 and step["statusTone"] == "Accent"
             ),
+            rich=rich,
         )
         for index, step in enumerate(steps)
     )
@@ -2881,7 +3045,7 @@ def build_progress_card(
             {
                 "type": "Container",
                 "id": "octo-execution-trace-header",
-                "style": "emphasis",
+                "style": _TRACE_TONE_STYLES.get(status_tone, "emphasis"),
                 "bleed": True,
                 "spacing": "None",
                 "items": [{
@@ -2894,7 +3058,7 @@ def build_progress_card(
                 "type": "Container",
                 "id": "timeline_detail",
                 "isVisible": detail_visible,
-                "spacing": "Medium",
+                "spacing": "None",
                 "items": trace_items,
             },
             *(
@@ -2903,7 +3067,7 @@ def build_progress_card(
                         "type": "Container",
                         "id": "collapsed_steps",
                         "isVisible": True,
-                        "spacing": "Medium",
+                        "spacing": "None",
                         "items": collapsed_items,
                     }
                 ]

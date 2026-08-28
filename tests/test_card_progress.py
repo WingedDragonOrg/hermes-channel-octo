@@ -903,9 +903,13 @@ def test_fallback_progress_matches_openclaw_group_window_and_terminal_collapse()
     assert detail["isVisible"] is False
     collapsed = rendered.card["body"][2]
     assert (collapsed["id"], collapsed["isVisible"]) == ("collapsed_steps", True)
-    assert collapsed["items"][0]["columns"][1]["items"][0]["text"] == (
-        "读取文件 × 12 · 总计 1.2s · 最近：/tmp/13.txt"
-    )
+    summary = collapsed["items"][0]["columns"][1]["items"][0]
+    assert summary["type"] == "RichTextBlock"
+    assert [run["text"] for run in summary["inlines"]] == [
+        "读取文件 × 12",
+        "  总计 1.2s · 最近：/tmp/13.txt",
+    ]
+    assert summary["inlines"][1]["fontType"] == "Monospace"
     collapse, expand = rendered.card["body"][3], rendered.card["body"][4]
     assert (collapse["id"], collapse["isVisible"]) == ("btn_collapse_trace", False)
     assert (expand["id"], expand["isVisible"]) == ("btn_expand_trace", True)
@@ -1442,7 +1446,9 @@ def test_reasoning_process_renderer_uses_collapsed_terminal_trace() -> None:
     body = rendered.card["body"]
     assert rendered.card["metadata"] == {"octo_layout": "agent_progress_v1"}
     assert body[0]["id"] == "octo-execution-trace-header"
-    assert body[0]["style"] == "emphasis"
+    # A finished run tints its header green; the state is legible before the
+    # first word is read.
+    assert body[0]["style"] == "good"
     assert body[1]["id"] == "trace_panel"
     assert body[1]["isVisible"] is False
     assert body[2]["id"] == "collapsed_panel"
@@ -1463,14 +1469,56 @@ def test_reasoning_process_renderer_uses_collapsed_terminal_trace() -> None:
         ],
     }
     collapsed_row = body[2]["items"][0]
-    assert collapsed_row["columns"][1]["items"][0]["text"] == (
-        "读取文件 · …/src/cards.py · 已完成"
-    )
+    name, detail = collapsed_row["columns"][1]["items"]
+    assert (name["text"], name["weight"]) == ("读取文件", "Bolder")
+    assert detail["text"] == "…/src/cards.py · 已完成"
+    assert detail["fontType"] == "Monospace"
     assert rendered.plain.startswith("处理进度 · 已完成 · 2.0s · 1 个阶段 · 1 次工具调用")
     assert "Check the implementation." in rendered.plain
     assert "读取文件 · …/src/cards.py · 已完成" in rendered.plain
     assert "✦" not in str(rendered.card)
     assert "Reasoning" not in str(rendered.card)
+
+
+def test_reasoning_process_renderer_merges_step_lines_with_rich_text() -> None:
+    rendered = cards.build_reasoning_process_card(
+        phase="thinking",
+        tools=[
+            {"tool_name": "read", "status": "complete", "summary": "…/src/cards.py"},
+            {"tool_name": "bash", "status": "running", "summary": "pytest -q"},
+        ],
+        elapsed_ms=41_200,
+        reasoning_id="session-1:turn-1",
+        capabilities=cards.CardCapabilities(
+            available=True,
+            enabled=True,
+            elements=frozenset({
+                "TextBlock",
+                "RichTextBlock",
+                "Container",
+                "ColumnSet",
+                "ActionSet",
+            }),
+            actions=frozenset({"Action.ToggleVisibility"}),
+        ),
+    )
+
+    header, trace = rendered.card["body"][0], rendered.card["body"][1]
+    chip = header["items"][0]["columns"][1]["items"][0]
+    # The status reads as a marked tag rather than one more coloured word.
+    assert chip["type"] == "RichTextBlock"
+    assert chip["inlines"][0]["highlight"] is True
+    assert chip["inlines"][0]["color"] == "Accent"
+    done_row = trace["items"][0]["items"][0]
+    line = done_row["columns"][1]["items"][0]
+    assert line["type"] == "RichTextBlock"
+    name, detail = line["inlines"]
+    assert (name["text"], name["weight"]) == ("读取文件", "Bolder")
+    assert "color" not in name
+    assert detail["text"] == "  …/src/cards.py"
+    assert (detail["fontType"], detail["isSubtle"]) == ("Monospace", True)
+    live_row = trace["items"][-1]["items"][-1]
+    assert live_row["columns"][1]["items"][0]["inlines"][0]["color"] == "Accent"
 
 
 def test_reasoning_process_renderer_marks_the_running_step_and_drops_filler() -> None:
@@ -1501,17 +1549,22 @@ def test_reasoning_process_renderer_marks_the_running_step_and_drops_filler() ->
     )
 
     header, trace = rendered.card["body"][0], rendered.card["body"][1]
+    assert header["style"] == "accent"
     meta = header["items"][0]["columns"][0]["items"][1]
     assert meta["text"] == "41.2s · 2 个阶段 · 2 次工具调用"
     assert trace["isVisible"] is True
     live = trace["items"][-1]["items"][-1]
-    assert live["style"] == "emphasis"
-    assert live["bleed"] is True
-    assert live["items"][0]["columns"][1]["items"][0]["color"] == "Accent"
-    # A finished step keeps a quiet dot, and its bare "已完成" line is dropped.
+    # The running step is marked by colour only: no band, no extra padding,
+    # and no connector below it because the rail ends there.
+    assert live["spacing"] == "None"
+    assert live["columns"][0]["items"][0]["text"] == "◉"
+    assert live["columns"][1]["items"][0]["color"] == "Accent"
+    # A finished step keeps its own status colour and joins the rail; its bare
+    # "已完成" line is dropped.
     done_row = trace["items"][0]["items"][1]
-    assert done_row["columns"][0]["items"][0]["isSubtle"] is True
-    assert "color" not in done_row["columns"][0]["items"][0]
+    done_glyph = done_row["columns"][0]["items"][0]
+    assert done_glyph["text"] == "●\n│"
+    assert done_glyph["color"] == "Good"
     assert len(done_row["columns"][1]["items"]) == 2
     card_text = str(rendered.card)
     assert "正在分析…" not in card_text

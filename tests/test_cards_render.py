@@ -52,16 +52,53 @@ def test_display_card_renders_controlled_text_with_plain_fallback() -> None:
             "text": "Approval request",
             "wrap": True,
             "weight": "Bolder",
+            "size": "Large",
         },
         {
             "type": "TextBlock",
             "text": "Details",
             "wrap": True,
             "weight": "Bolder",
+            "size": "Small",
+            "isSubtle": True,
+            "spacing": "Medium",
         },
-        {"type": "TextBlock", "text": "Please review", "wrap": True},
+        {
+            "type": "TextBlock",
+            "text": "Please review",
+            "wrap": True,
+            "spacing": "Small",
+        },
     ]
     assert rendered.plain == "Approval request\nDetails\nPlease review"
+
+
+def test_display_card_spacing_groups_labels_and_paragraph_streams() -> None:
+    rendered = cards.build_display_card(
+        blocks=[
+            {"type": "heading", "text": "任务理解"},
+            {"type": "text", "text": "教父想看一张新的推理卡片。"},
+            {"type": "text", "text": "所以这次直接给卡片，不再描述它。"},
+            {"type": "facts", "items": [{"label": "状态", "value": "已完成"}]},
+            {"type": "text", "text": "结论：这张卡片本身，就是演示。"},
+        ],
+    )
+
+    label, owned, streamed, facts, after_group = rendered.card["body"]
+    # Space encodes grouping: nothing above the first element, a quiet label
+    # owning the line below it, running copy kept as one stream, and a new
+    # group opening after anything else.
+    assert "spacing" not in label
+    assert (label["size"], label["isSubtle"], label["weight"]) == (
+        "Small",
+        True,
+        "Bolder",
+    )
+    assert owned["spacing"] == "Small"
+    assert "size" not in owned and "isSubtle" not in owned
+    assert "spacing" not in streamed
+    assert facts["spacing"] == "Medium"
+    assert after_group["spacing"] == "Medium"
 
 
 def test_manifest_gate_distinguishes_missing_endpoint_from_disabled_server() -> None:
