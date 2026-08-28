@@ -1554,18 +1554,21 @@ def test_reasoning_process_renderer_marks_the_running_step_and_drops_filler() ->
     assert meta["text"] == "41.2s · 2 个阶段 · 2 次工具调用"
     assert trace["isVisible"] is True
     live = trace["items"][-1]["items"][-1]
-    # The running step is marked by colour only: no band, no extra padding,
-    # and no connector below it because the rail ends there.
-    assert live["spacing"] == "None"
+    # The running step opens its own phase group, is marked by colour only, and
+    # ends the rail: no trailing pad, but the separator still runs beside it.
+    assert live["spacing"] == "Medium"
     assert live["columns"][0]["items"][0]["text"] == "◉"
+    assert live["columns"][1]["separator"] is True
+    assert len(live["columns"][1]["items"]) == 2
     assert live["columns"][1]["items"][0]["color"] == "Accent"
-    # A finished step keeps its own status colour and joins the rail; its bare
-    # "已完成" line is dropped.
+    # A finished step keeps its own status colour, rides the rail with no row
+    # spacing, and carries the pad that leaves air before the next step.
     done_row = trace["items"][0]["items"][1]
     done_glyph = done_row["columns"][0]["items"][0]
-    assert done_glyph["text"] == "●\n│"
+    assert done_glyph["text"] == "●"
     assert done_glyph["color"] == "Good"
-    assert len(done_row["columns"][1]["items"]) == 2
+    assert done_row["columns"][1]["separator"] is True
+    assert len(done_row["columns"][1]["items"]) == 3
     card_text = str(rendered.card)
     assert "正在分析…" not in card_text
     assert card_text.count("正在处理…") == 0

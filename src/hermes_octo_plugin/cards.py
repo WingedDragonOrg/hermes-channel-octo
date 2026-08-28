@@ -2224,18 +2224,9 @@ _TRACE_TONE_STYLES: dict[str, str] = {
 }
 
 
-def _trace_glyph_block(
-    glyph: str,
-    tone: str,
-    *,
-    last: bool,
-) -> dict[str, object]:
-    """Dot plus connector: the rail is drawn in text, so it always renders."""
-    return _reasoning_text_block(
-        glyph if last else f"{glyph}\n│",
-        spacing="None",
-        color=tone,
-    )
+def _trace_glyph_block(glyph: str, tone: str) -> dict[str, object]:
+    """Only the dot: the rail itself is the column separator next to it."""
+    return _reasoning_text_block(glyph, spacing="None", color=tone)
 
 
 def _trace_status_chip(
@@ -2389,7 +2380,25 @@ def _trace_row(
     tone: str,
     spacing: str,
     last: bool,
+    rail: bool = True,
 ) -> dict[str, object]:
+    # The client collapses "\n" inside a TextBlock, so a text connector lands
+    # beside the dot as often as below it. The column separator is drawn by the
+    # host, spans the whole row, and meets the next row when they abut.
+    body = list(items)
+    if rail and not last:
+        # Air between steps has to live inside the row: spacing between rows
+        # would break the rail it is meant to leave room for.
+        body.append(
+            _reasoning_text_block("\u00a0", size="Small", spacing="None")
+        )
+    content: dict[str, object] = {
+        "type": "Column",
+        "width": "stretch",
+        "items": body,
+    }
+    if rail:
+        content["separator"] = True
     return {
         "type": "ColumnSet",
         "spacing": spacing,
@@ -2397,13 +2406,9 @@ def _trace_row(
             {
                 "type": "Column",
                 "width": "auto",
-                "items": [_trace_glyph_block(glyph, tone, last=last)],
+                "items": [_trace_glyph_block(glyph, tone)],
             },
-            {
-                "type": "Column",
-                "width": "stretch",
-                "items": items,
-            },
+            content,
         ],
     }
 
@@ -2412,7 +2417,7 @@ def _reasoning_action_row(
     action: Mapping[str, object],
     *,
     last: bool,
-    first: bool = False,
+    lead: bool = False,
     live: bool = False,
     rich: bool = False,
 ) -> dict[str, object]:
@@ -2427,7 +2432,8 @@ def _reasoning_action_row(
         ),
         glyph=str(action["statusGlyph"]),
         tone=tone,
-        spacing="None" if first else "Small",
+        # The first step opens the group; the rest ride the rail with no gap.
+        spacing="Medium" if lead else "None",
         last=last,
     )
 
@@ -2439,6 +2445,7 @@ def _reasoning_summary_row(
     tone: str,
     spacing: str,
     last: bool = True,
+    rail: bool = True,
 ) -> dict[str, object]:
     return _trace_row(
         [_reasoning_text_block(text, spacing="None", color=tone)],
@@ -2446,6 +2453,7 @@ def _reasoning_summary_row(
         tone=tone,
         spacing=spacing,
         last=last,
+        rail=rail,
     )
 
 
@@ -2472,9 +2480,9 @@ def _reasoning_phase_block(
     items.extend(
         _reasoning_action_row(
             action,
-            # The rail runs through every step and stops at the last one.
+            # The rail stops only where the trace itself stops.
             last=tail and index == len(actions) - 1,
-            first=index == 0 and not items,
+            lead=index == 0,
             live=live and index == len(actions) - 1,
             rich=rich,
         )
@@ -2482,7 +2490,7 @@ def _reasoning_phase_block(
     )
     return {
         "type": "Container",
-        "spacing": "None" if first else "Medium" if speaks else "Small",
+        "spacing": "None" if first or not speaks else "Medium",
         "separator": speaks and not first,
         "items": items,
     }
@@ -2590,7 +2598,7 @@ def build_reasoning_process_card(
                 progress_text,
                 glyph="◉",
                 tone="Accent",
-                spacing="Small",
+                spacing="None",
                 last=not data.get("errorMessage"),
             )
         )
@@ -2601,7 +2609,7 @@ def build_reasoning_process_card(
                 str(data["errorMessage"]),
                 glyph="○",
                 tone="Attention",
-                spacing="Small",
+                spacing="None",
             )
         )
     collapsed_row = (
@@ -2617,6 +2625,7 @@ def build_reasoning_process_card(
             tone=str(last_action["statusTone"]),
             spacing="None",
             last=True,
+            rail=False,
         )
         if last_action is not None
         else _reasoning_summary_row(
@@ -2624,6 +2633,7 @@ def build_reasoning_process_card(
             glyph="●",
             tone=str(data["statusTone"]),
             spacing="None",
+            rail=False,
         )
     )
     body: list[dict[str, object]] = [
@@ -2676,14 +2686,14 @@ def build_reasoning_process_card(
             "type": "Container",
             "id": "trace_panel",
             "isVisible": trace_visible,
-            "spacing": "None",
+            "spacing": "Small",
             "items": trace_items,
         },
         {
             "type": "Container",
             "id": "collapsed_panel",
             "isVisible": can_toggle and bool(data["traceCollapsed"]),
-            "spacing": "None",
+            "spacing": "Small",
             "items": [collapsed_row],
         },
     ]
@@ -2992,6 +3002,7 @@ def build_progress_card(
                 tone=steps[-1]["statusTone"],
                 spacing="None",
                 last=True,
+                rail=False,
             )
         ]
     )
@@ -3018,7 +3029,7 @@ def build_progress_card(
     trace_items.extend(
         _reasoning_action_row(
             step,
-            first=index == 0 and not hidden,
+            lead=index == 0,
             last=index == len(steps) - 1,
             live=(
                 index == len(steps) - 1
@@ -3058,7 +3069,7 @@ def build_progress_card(
                 "type": "Container",
                 "id": "timeline_detail",
                 "isVisible": detail_visible,
-                "spacing": "None",
+                "spacing": "Small",
                 "items": trace_items,
             },
             *(
@@ -3067,7 +3078,7 @@ def build_progress_card(
                         "type": "Container",
                         "id": "collapsed_steps",
                         "isVisible": True,
-                        "spacing": "None",
+                        "spacing": "Small",
                         "items": collapsed_items,
                     }
                 ]
