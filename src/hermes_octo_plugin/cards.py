@@ -981,7 +981,14 @@ def validate_card_limits(
         raise CardLimitError("card exceeds max_payload_bytes")
 
 
-def _text_element(text: str, *, bold: bool = False) -> dict[str, Any]:
+def _text_element(
+    text: str,
+    *,
+    bold: bool = False,
+    size: str | None = None,
+    subtle: bool = False,
+    spacing: str | None = None,
+) -> dict[str, Any]:
     element: dict[str, Any] = {
         "type": "TextBlock",
         "text": literal_card_text(text),
@@ -989,7 +996,30 @@ def _text_element(text: str, *, bold: bool = False) -> dict[str, Any]:
     }
     if bold:
         element["weight"] = "Bolder"
+    if size is not None:
+        element["size"] = size
+    if subtle:
+        element["isSubtle"] = True
+    if spacing is not None:
+        element["spacing"] = spacing
     return element
+
+
+# Display cards invert the usual chat-bot hierarchy: section labels shrink and
+# grey out so the content they introduce stays the loudest thing on the card.
+def _display_label(text: str, *, spacing: str | None) -> dict[str, Any]:
+    return _text_element(text, bold=True, size="Small", subtle=True, spacing=spacing)
+
+
+# Spacing above a body line, keyed by what precedes it: a label owns the line
+# below it, consecutive body copy stays a paragraph stream, and any other
+# element starts a fresh group.
+_DISPLAY_TEXT_SPACING: dict[str | None, str | None] = {
+    None: None,
+    "label": "Small",
+    "text": None,
+    "group": "Medium",
+}
 
 
 def _block_text(block: Mapping[str, object]) -> str | None:
@@ -1046,17 +1076,43 @@ def build_display_card(
     body: list[dict[str, Any]] = []
     plain_lines: list[str] = []
 
-    def append_text(text: str, *, bold: bool = False) -> None:
+    def append_text(
+        text: str,
+        *,
+        bold: bool = False,
+        size: str | None = None,
+        spacing: str | None = None,
+    ) -> None:
         _require_element(capabilities, "TextBlock")
-        body.append(_text_element(text, bold=bold))
+        body.append(_text_element(text, bold=bold, size=size, spacing=spacing))
         plain_lines.append(text)
+
+    # Vertical space encodes grouping: a label owns the line under it, running
+    # body copy stays a stream, and anything else starts a new group.
+    previous: str | None = None
+
+    def group_spacing() -> str | None:
+        # Leading spacing is inert, so only separate a group from what precedes.
+        return "Medium" if body else None
+
+    def append_label(text: str) -> None:
+        _require_element(capabilities, "TextBlock")
+        body.append(_display_label(text, spacing=group_spacing()))
+        plain_lines.append(text)
+
+    def group_block(element: dict[str, Any]) -> dict[str, Any]:
+        spacing = group_spacing()
+        if spacing is not None:
+            element["spacing"] = spacing
+        return element
 
     if title is not None:
         if not isinstance(title, str):
             raise ValueError("display card title must be a string")
         clean_title = sanitize_visible_text(title)
         if clean_title is not None:
-            append_text(clean_title, bold=True)
+            append_text(clean_title, bold=True, size="Large")
+            previous = "group"
 
     for block in blocks:
         if not isinstance(block, Mapping):
@@ -1065,12 +1121,18 @@ def build_display_card(
         if block_type in {"heading", "text"}:
             text = _block_text(block)
             if text is not None:
-                append_text(text, bold=block_type == "heading")
+                if block_type == "heading":
+                    append_label(text)
+                    previous = "label"
+                else:
+                    append_text(text, spacing=_DISPLAY_TEXT_SPACING[previous])
+                    previous = "text"
             continue
+        previous = "group"
         if block_type == "section":
             section_elements: list[dict[str, Any]] = []
             section_plain: list[str] = []
-            for field, bold in (("title", True), ("text", False)):
+            for field, is_label in (("title", True), ("text", False)):
                 raw = block.get(field)
                 if raw is None:
                     continue
@@ -1079,12 +1141,25 @@ def build_display_card(
                 clean = sanitize_visible_text(raw)
                 if clean is not None:
                     _require_element(capabilities, "TextBlock")
-                    section_elements.append(_text_element(clean, bold=bold))
+                    section_elements.append(
+                        _display_label(
+                            clean,
+                            spacing=None if not section_elements else "Medium",
+                        )
+                        if is_label
+                        else _text_element(
+                            clean,
+                            spacing="Small" if section_elements else None,
+                        )
+                    )
                     section_plain.append(clean)
             if not section_elements:
                 continue
             if capabilities is None or _supports(capabilities.elements, "Container"):
-                body.append({"type": "Container", "items": section_elements})
+                body.append(group_block({
+                    "type": "Container",
+                    "items": section_elements,
+                }))
             else:
                 body.extend(section_elements)
             plain_lines.extend(section_plain)
@@ -1118,7 +1193,10 @@ def build_display_card(
             if not facts:
                 continue
             if capabilities is None or _supports(capabilities.elements, "FactSet"):
-                body.append({"type": "FactSet", "facts": facts})
+                body.append(group_block({
+                    "type": "FactSet",
+                    "facts": facts,
+                }))
             else:
                 _require_element(capabilities, "TextBlock")
                 body.extend(_text_element(line) for line in lines)
@@ -1137,11 +1215,11 @@ def build_display_card(
                 raise ValueError("display image URL must be a safe http URL")
             line = f"{clean_alt}: {origin}"
             if capabilities is None or _supports(capabilities.elements, "Image"):
-                body.append({
+                body.append(group_block({
                     "type": "Image",
                     "url": resource_url,
                     "altText": literal_card_text(clean_alt),
-                })
+                }))
             else:
                 _require_element(capabilities, "TextBlock")
                 body.append(_text_element(line))
@@ -1184,7 +1262,10 @@ def build_display_card(
                 or _supports(capabilities.actions, "Action.OpenUrl")
             )
             if can_render_actions:
-                body.append({"type": "ActionSet", "actions": actions})
+                body.append(group_block({
+                    "type": "ActionSet",
+                    "actions": actions,
+                }))
             else:
                 _require_element(capabilities, "TextBlock")
                 body.extend(_text_element(line) for line in lines)
@@ -2132,85 +2213,319 @@ def _reasoning_text_block(
     }
 
 
-def _reasoning_action_row(
-    action: Mapping[str, object],
+_TRACE_GLYPH_DETAILS = frozenset({"已完成", "进行中"})
+# Container tints carry the run's own state, so the shaded areas of the card
+# mean something instead of merely being grey furniture.
+_TRACE_TONE_STYLES: dict[str, str] = {
+    "Accent": "accent",
+    "Attention": "attention",
+    "Warning": "warning",
+    "Good": "good",
+}
+
+
+def _trace_glyph_block(glyph: str, tone: str) -> dict[str, object]:
+    """Only the dot: the rail itself is the column separator next to it."""
+    return _reasoning_text_block(glyph, spacing="None", color=tone)
+
+
+def _trace_status_chip(
+    label: str,
+    tone: str,
     *,
-    first: bool,
-    last: bool,
+    rich: bool,
 ) -> dict[str, object]:
-    glyph = str(action["statusGlyph"])
-    rail = glyph if last else f"{glyph}\n│"
+    """The status reads as a marked tag, not as one more coloured word."""
+    if not rich:
+        return _reasoning_text_block(
+            label,
+            color=tone,
+            weight="Bolder",
+            size="Small",
+            spacing="None",
+            horizontalAlignment="Right",
+        )
+    return {
+        "type": "RichTextBlock",
+        "spacing": "None",
+        "horizontalAlignment": "Right",
+        "inlines": [
+            {
+                "type": "TextRun",
+                "text": literal_card_text(f" {label} "),
+                "color": tone,
+                "weight": "Bolder",
+                "size": "Small",
+                "highlight": True,
+            }
+        ],
+    }
+
+
+_TRACE_COLLAPSE_ID = "btn_collapse_trace"
+_TRACE_EXPAND_ID = "btn_expand_trace"
+
+
+def _trace_toggle_bar(
+    panels: Sequence[tuple[str, bool]],
+    *,
+    expanded: bool,
+) -> list[dict[str, object]]:
+    """Two mirrored buttons so the label always names what the click does."""
+
+    def targets(opening: bool) -> list[dict[str, object]]:
+        toggles: list[dict[str, object]] = [
+            {"elementId": panel, "isVisible": shown_when_open is opening}
+            for panel, shown_when_open in panels
+        ]
+        toggles.append({"elementId": _TRACE_COLLAPSE_ID, "isVisible": opening})
+        toggles.append({"elementId": _TRACE_EXPAND_ID, "isVisible": not opening})
+        return toggles
+
+    return [
+        {
+            "type": "ActionSet",
+            "id": _TRACE_COLLAPSE_ID,
+            "isVisible": expanded,
+            "horizontalAlignment": "Right",
+            "spacing": "Medium",
+            "actions": [
+                {
+                    "type": "Action.ToggleVisibility",
+                    "id": "trace_collapse",
+                    "title": "收起执行详情",
+                    "targetElements": targets(False),
+                }
+            ],
+        },
+        {
+            "type": "ActionSet",
+            "id": _TRACE_EXPAND_ID,
+            "isVisible": not expanded,
+            "horizontalAlignment": "Right",
+            "spacing": "Medium",
+            "actions": [
+                {
+                    "type": "Action.ToggleVisibility",
+                    "id": "trace_expand",
+                    "title": "展开执行详情",
+                    "targetElements": targets(True),
+                }
+            ],
+        },
+    ]
+
+
+def _trace_step_items(
+    name: str,
+    detail: str,
+    *,
+    tone: str,
+    live: bool,
+    rich: bool,
+) -> list[dict[str, object]]:
+    """One log line: the step reads as a sentence, machine text stays machine."""
+    # The status dot already says "done" or "running"; the detail is only worth
+    # its ink when it carries the command, path, result, or error.
+    body = "" if detail in _TRACE_GLYPH_DETAILS else detail
+    if not rich:
+        items: list[dict[str, object]] = [
+            _reasoning_text_block(
+                name,
+                weight="Bolder",
+                spacing="None",
+                **({"color": tone} if live else {}),
+            )
+        ]
+        if body:
+            items.append(
+                _reasoning_text_block(
+                    body,
+                    isSubtle=True,
+                    size="Small",
+                    spacing="None",
+                    fontType="Monospace",
+                )
+            )
+        return items
+    inlines: list[dict[str, object]] = [
+        {
+            "type": "TextRun",
+            "text": literal_card_text(name),
+            "weight": "Bolder",
+            **({"color": tone} if live else {}),
+        }
+    ]
+    if body:
+        inlines.append({
+            "type": "TextRun",
+            "text": literal_card_text(f"  {body}"),
+            "fontType": "Monospace",
+            "size": "Small",
+            "isSubtle": True,
+        })
+    return [
+        {
+            "type": "RichTextBlock",
+            "spacing": "None",
+            "inlines": inlines,
+        }
+    ]
+
+
+def _trace_row(
+    items: list[dict[str, object]],
+    *,
+    glyph: str,
+    tone: str,
+    spacing: str,
+    last: bool,
+    rail: bool = True,
+) -> dict[str, object]:
+    # The client collapses "\n" inside a TextBlock, so a text connector lands
+    # beside the dot as often as below it. The column separator is drawn by the
+    # host, spans the whole row, and meets the next row when they abut.
+    body = list(items)
+    if rail and not last:
+        # Air between steps has to live inside the row: spacing between rows
+        # would break the rail it is meant to leave room for.
+        body.append(
+            _reasoning_text_block("\u00a0", size="Small", spacing="None")
+        )
+    content: dict[str, object] = {
+        "type": "Column",
+        "width": "stretch",
+        "items": body,
+    }
+    if rail:
+        content["separator"] = True
     return {
         "type": "ColumnSet",
-        "spacing": "None" if first else "Small",
+        "spacing": spacing,
         "columns": [
             {
                 "type": "Column",
                 "width": "auto",
-                "items": [
-                    _reasoning_text_block(
-                        rail,
-                        color=str(action["statusTone"]),
-                        size="Small",
-                        spacing="None",
-                    )
-                ],
+                "items": [_trace_glyph_block(glyph, tone)],
             },
-            {
-                "type": "Column",
-                "width": "stretch",
-                "items": [
-                    _reasoning_text_block(
-                        str(action["tool"]),
-                        weight="Bolder",
-                        size="Small",
-                        spacing="None",
-                    ),
-                    _reasoning_text_block(
-                        str(action["detail"]),
-                        isSubtle=True,
-                        size="Small",
-                        spacing="None",
-                        fontType="Monospace",
-                    ),
-                ],
-            },
+            content,
         ],
     }
+
+
+def _reasoning_action_row(
+    action: Mapping[str, object],
+    *,
+    last: bool,
+    lead: bool = False,
+    live: bool = False,
+    rich: bool = False,
+) -> dict[str, object]:
+    tone = str(action["statusTone"])
+    return _trace_row(
+        _trace_step_items(
+            str(action["tool"]),
+            str(action["detail"]),
+            tone=tone,
+            live=live,
+            rich=rich,
+        ),
+        glyph=str(action["statusGlyph"]),
+        tone=tone,
+        # The first step opens the group; the rest ride the rail with no gap.
+        spacing="Medium" if lead else "None",
+        last=last,
+    )
+
+
+def _reasoning_summary_row(
+    text: str,
+    *,
+    glyph: str,
+    tone: str,
+    spacing: str,
+    last: bool = True,
+    rail: bool = True,
+) -> dict[str, object]:
+    return _trace_row(
+        [_reasoning_text_block(text, spacing="None", color=tone)],
+        glyph=glyph,
+        tone=tone,
+        spacing=spacing,
+        last=last,
+        rail=rail,
+    )
+
+
+def _phase_speaks(phase: Mapping[str, object]) -> bool:
+    """The placeholder thought repeats once per phase and says less than the
+    actions below it, so a phase only opens a new beat when it really spoke."""
+    raw_actions = phase["actions"]
+    assert isinstance(raw_actions, list)
+    actions = [action for action in raw_actions if isinstance(action, Mapping)]
+    return not actions or str(phase["thought"]) != _REASONING_FALLBACK_THOUGHT
 
 
 def _reasoning_phase_block(
     phase: Mapping[str, object],
     *,
     first: bool,
+    tail: bool,
+    live: bool = False,
+    rich: bool = False,
 ) -> dict[str, object]:
     raw_actions = phase["actions"]
     assert isinstance(raw_actions, list)
+    actions = [action for action in raw_actions if isinstance(action, Mapping)]
+    thought = str(phase["thought"])
+    speaks = _phase_speaks(phase)
+    items: list[dict[str, object]] = (
+        [_reasoning_text_block(thought, spacing="None")]
+        if speaks
+        else []
+    )
+    # A container never draws spacing on its own first element, so when rows
+    # open the panel their lead air is inert and the panel carries it instead.
+    hoisted = first and not speaks
+    items.extend(
+        _reasoning_action_row(
+            action,
+            # The rail stops only where the trace itself stops.
+            last=tail and index == len(actions) - 1,
+            lead=index == 0 and not hoisted,
+            live=live and index == len(actions) - 1,
+            rich=rich,
+        )
+        for index, action in enumerate(actions)
+    )
     return {
         "type": "Container",
-        "spacing": "None" if first else "Large",
-        "separator": not first,
-        "items": [
-            _reasoning_text_block(
-                str(phase["thought"]),
-                size="Small",
-                spacing="None",
-            ),
-            {
-                "type": "Container",
-                "spacing": "Small",
-                "items": [
-                    _reasoning_action_row(
-                        action,
-                        first=index == 0,
-                        last=index == len(raw_actions) - 1,
-                    )
-                    for index, action in enumerate(raw_actions)
-                    if isinstance(action, Mapping)
-                ],
-            },
-        ],
+        "spacing": "None" if first or not speaks else "Medium",
+        "separator": speaks and not first,
+        "items": items,
     }
+
+
+def _reasoning_meta_text(
+    data: Mapping[str, object],
+    *,
+    elapsed_ms: object,
+    tools: Sequence[Mapping[str, object]],
+    phase_total: int,
+) -> str:
+    """Trade the active-state placeholder for the live run counters."""
+    if str(data["state"]) not in {"reasoning", "answering"}:
+        return str(data["timerText"])
+    tool_count = sum(
+        tool.get("tool_name") not in {"__thinking__", "__subagent_wait__"}
+        for tool in tools
+    )
+    parts = [format_progress_duration(elapsed_ms) or "0ms"]
+    if phase_total:
+        parts.append(f"{phase_total} 个阶段")
+    if tool_count:
+        parts.append(f"{tool_count} 次工具调用")
+    return " · ".join(parts)
 
 
 def build_reasoning_process_card(
@@ -2246,6 +2561,7 @@ def build_reasoning_process_card(
     )
     raw_phases = data["phases"]
     assert isinstance(raw_phases, list)
+    phase_total = len(raw_phases)
     phases = _trim_reasoning_phases(raw_phases)
     data["phases"] = phases
     can_toggle = (
@@ -2254,12 +2570,90 @@ def build_reasoning_process_card(
         and capabilities.actions is not None
         and "Action.ToggleVisibility" in capabilities.actions
     )
+    rich = capabilities is None or _supports(capabilities.elements, "RichTextBlock")
     trace_visible = bool(data["traceExpanded"]) if can_toggle else True
+    meta_text = _reasoning_meta_text(
+        data,
+        elapsed_ms=elapsed_ms,
+        tools=tools,
+        phase_total=phase_total,
+    )
+    tail_actions = phases[-1]["actions"] if phases else []
+    assert isinstance(tail_actions, list)
+    last_actions = [
+        action for action in tail_actions if isinstance(action, Mapping)
+    ]
+    last_action = last_actions[-1] if last_actions else None
+    running_last = (
+        last_action is not None and str(last_action["statusTone"]) == "Accent"
+    )
+    progress_text = str(data.get("progressText") or "")
+    if running_last and str(data["state"]) == "reasoning":
+        # The running step already carries the live line; one is enough.
+        progress_text = ""
+    has_tail = bool(progress_text) or bool(data.get("errorMessage"))
+    trace_items: list[dict[str, object]] = [
+        _reasoning_phase_block(
+            item,
+            first=index == 0,
+            tail=index == len(phases) - 1 and not has_tail,
+            live=running_last and index == len(phases) - 1,
+            rich=rich,
+        )
+        for index, item in enumerate(phases)
+    ]
+    # A thought line opens the panel with its own air; rows do not, so the
+    # panel hands the lead row the beat its own spacing cannot draw.
+    trace_lead = "Small" if phases and _phase_speaks(phases[0]) else "Medium"
+    if progress_text:
+        trace_items.append(
+            _reasoning_summary_row(
+                progress_text,
+                glyph="◉",
+                tone="Accent",
+                spacing="None",
+                last=not data.get("errorMessage"),
+            )
+        )
+    if data.get("errorMessage"):
+        # The header already raises the alarm; this line only explains it.
+        trace_items.append(
+            _reasoning_summary_row(
+                str(data["errorMessage"]),
+                glyph="○",
+                tone="Attention",
+                spacing="None",
+            )
+        )
+    collapsed_row = (
+        _trace_row(
+            _trace_step_items(
+                str(last_action["tool"]),
+                str(last_action["detail"]),
+                tone=str(last_action["statusTone"]),
+                live=False,
+                rich=rich,
+            ),
+            glyph=str(last_action["statusGlyph"]),
+            tone=str(last_action["statusTone"]),
+            spacing="None",
+            last=True,
+            rail=False,
+        )
+        if last_action is not None
+        else _reasoning_summary_row(
+            str(data["collapsedSummary"]),
+            glyph="●",
+            tone=str(data["statusTone"]),
+            spacing="None",
+            rail=False,
+        )
+    )
     body: list[dict[str, object]] = [
         {
             "type": "Container",
             "id": "octo-execution-trace-header",
-            "style": "emphasis",
+            "style": _TRACE_TONE_STYLES.get(str(data["statusTone"]), "emphasis"),
             "bleed": True,
             "spacing": "None",
             "items": [
@@ -2274,13 +2668,15 @@ def build_reasoning_process_card(
                                 _reasoning_text_block(
                                     str(data["title"]),
                                     weight="Bolder",
+                                    size="Large",
                                     spacing="None",
                                 ),
                                 _reasoning_text_block(
-                                    str(data["timerText"]),
+                                    meta_text,
                                     size="Small",
                                     isSubtle=True,
                                     spacing="Small",
+                                    fontType="Monospace",
                                 ),
                             ],
                         },
@@ -2288,12 +2684,10 @@ def build_reasoning_process_card(
                             "type": "Column",
                             "width": "auto",
                             "items": [
-                                _reasoning_text_block(
+                                _trace_status_chip(
                                     str(data["statusLabel"]),
-                                    color=data["statusTone"],
-                                    weight="Bolder",
-                                    size="Small",
-                                    spacing="None",
+                                    str(data["statusTone"]),
+                                    rich=rich,
                                 )
                             ],
                         },
@@ -2305,101 +2699,36 @@ def build_reasoning_process_card(
             "type": "Container",
             "id": "trace_panel",
             "isVisible": trace_visible,
-            "spacing": "Large",
-            "items": [
-                *[
-                    _reasoning_phase_block(item, first=index == 0)
-                    for index, item in enumerate(phases)
-                ],
-                *(
-                    [
-                        _reasoning_text_block(
-                            f"◉  {data['progressText']}",
-                            color="Accent",
-                            size="Small",
-                            spacing="Large",
-                        )
-                    ]
-                    if data.get("progressText")
-                    else []
-                ),
-                *(
-                    [
-                        {
-                            "type": "Container",
-                            "style": "attention",
-                            "spacing": "Large",
-                            "items": [
-                                _reasoning_text_block(
-                                    str(data.get("errorTitle", "处理未完成")),
-                                    weight="Bolder",
-                                    color="Attention",
-                                    spacing="None",
-                                ),
-                                _reasoning_text_block(
-                                    str(data["errorMessage"]),
-                                    size="Small",
-                                    spacing="Small",
-                                ),
-                            ],
-                        }
-                    ]
-                    if data.get("errorMessage")
-                    else []
-                ),
-            ],
+            "spacing": trace_lead,
+            "items": trace_items,
         },
         {
             "type": "Container",
             "id": "collapsed_panel",
             "isVisible": can_toggle and bool(data["traceCollapsed"]),
             "spacing": "Medium",
-            "items": [
-                _reasoning_text_block(
-                    f"●  {data['collapsedSummary']}",
-                    color=str(data["statusTone"]),
-                    size="Small",
-                    isSubtle=True,
-                    spacing="None",
-                )
-            ],
+            "items": [collapsed_row],
         },
     ]
     if can_toggle:
-        body.append({
-            "type": "Container",
-            "style": "emphasis",
-            "bleed": True,
-            "separator": True,
-            "spacing": "Large",
-            "items": [
-                {
-                    "type": "ActionSet",
-                    "horizontalAlignment": "Right",
-                    "actions": [
-                        {
-                            "type": "Action.ToggleVisibility",
-                            "id": "reasoning_toggle",
-                            "title": "展开/收起执行详情",
-                            "targetElements": [
-                                "trace_panel",
-                                "collapsed_panel",
-                            ],
-                        }
-                    ],
-                }
-            ],
-        })
-    plain_lines = [f"{data['title']} · {data['statusLabel']} · {data['timerText']}"]
+        body.extend(
+            _trace_toggle_bar(
+                (("trace_panel", True), ("collapsed_panel", False)),
+                expanded=trace_visible,
+            )
+        )
+    plain_lines = [f"{data['title']} · {data['statusLabel']} · {meta_text}"]
     for item in phases:
-        plain_lines.append(str(item["thought"]))
         actions = item["actions"]
         assert isinstance(actions, list)
+        thought = str(item["thought"])
+        if not actions or thought != _REASONING_FALLBACK_THOUGHT:
+            plain_lines.append(thought)
         for action in actions:
             if isinstance(action, Mapping):
                 plain_lines.append(f"{action['tool']} · {action['detail']}")
-    if data.get("progressText"):
-        plain_lines.append(str(data["progressText"]))
+    if progress_text:
+        plain_lines.append(progress_text)
     if data.get("errorMessage"):
         plain_lines.append(str(data["errorMessage"]))
     result = CardRenderResult(
@@ -2621,7 +2950,9 @@ def build_progress_card(
         and "Action.ToggleVisibility" in capabilities.actions
     )
     terminal = phase in {"completed", "stopped", "failed", "error", "expired"}
-    detail_visible = not (can_toggle and terminal)
+    # Collapsing to an empty card tells the reader nothing, so a finished run
+    # only folds away when its last step can stand in for the trace.
+    detail_visible = not (can_toggle and terminal and bool(steps))
     status_label, status_tone = _progress_state(phase)
     summary_parts = []
     if real_tools:
@@ -2638,14 +2969,9 @@ def build_progress_card(
     if elapsed:
         summary_parts.append(elapsed)
     summary_text = " · ".join(summary_parts) or "正在准备"
+    rich = _supports(capabilities.elements, "RichTextBlock")
     status_items: list[dict[str, object]] = [
-        _reasoning_text_block(
-            status_label,
-            color=status_tone,
-            weight="Bolder",
-            size="Small",
-            spacing="None",
-        )
+        _trace_status_chip(status_label, status_tone, rich=rich)
     ]
     header_columns: list[dict[str, object]] = [
         {
@@ -2655,6 +2981,7 @@ def build_progress_card(
                 _reasoning_text_block(
                     "处理进度",
                     weight="Bolder",
+                    size="Large",
                     spacing="None",
                 ),
                 _reasoning_text_block(
@@ -2662,6 +2989,7 @@ def build_progress_card(
                     size="Small",
                     isSubtle=True,
                     spacing="Small",
+                    fontType="Monospace",
                 ),
             ],
         },
@@ -2671,37 +2999,36 @@ def build_progress_card(
             "items": status_items,
         },
     ]
-    if can_toggle:
-        status_items.extend([
-            {
-                "type": "ActionSet",
-                "id": "btn_collapse",
-                "isVisible": detail_visible,
-                "actions": [{
-                    "type": "Action.ToggleVisibility",
-                    "title": "收起执行详情",
-                    "targetElements": [
-                        {"elementId": "timeline_detail", "isVisible": False},
-                        {"elementId": "btn_collapse", "isVisible": False},
-                        {"elementId": "btn_expand", "isVisible": True},
-                    ],
-                }],
-            },
-            {
-                "type": "ActionSet",
-                "id": "btn_expand",
-                "isVisible": not detail_visible,
-                "actions": [{
-                    "type": "Action.ToggleVisibility",
-                    "title": "展开执行详情",
-                    "targetElements": [
-                        {"elementId": "timeline_detail", "isVisible": True},
-                        {"elementId": "btn_collapse", "isVisible": True},
-                        {"elementId": "btn_expand", "isVisible": False},
-                    ],
-                }],
-            },
-        ])
+    collapsed_items: list[dict[str, object]] = (
+        []
+        if detail_visible or not steps
+        else [
+            _trace_row(
+                _trace_step_items(
+                    steps[-1]["tool"],
+                    steps[-1]["detail"],
+                    tone=steps[-1]["statusTone"],
+                    live=False,
+                    rich=rich,
+                ),
+                glyph=steps[-1]["statusGlyph"],
+                tone=steps[-1]["statusTone"],
+                spacing="None",
+                last=True,
+                rail=False,
+            )
+        ]
+    )
+    toggle_bar = (
+        _trace_toggle_bar(
+            (("timeline_detail", True), ("collapsed_steps", False))
+            if collapsed_items
+            else (("timeline_detail", True),),
+            expanded=detail_visible,
+        )
+        if can_toggle
+        else []
+    )
     trace_items: list[dict[str, object]] = []
     if hidden:
         trace_items.append(
@@ -2712,11 +3039,20 @@ def build_progress_card(
                 spacing="None",
             )
         )
+    # The hidden-step notice opens the panel with its own line; without it the
+    # rows lead, and a container draws no spacing on its first element, so the
+    # panel below carries that air instead.
+    hoisted = not hidden
     trace_items.extend(
         _reasoning_action_row(
             step,
-            first=index == 0 and not hidden,
+            lead=index == 0 and not hoisted,
             last=index == len(steps) - 1,
+            live=(
+                index == len(steps) - 1
+                and step["statusTone"] == "Accent"
+            ),
+            rich=rich,
         )
         for index, step in enumerate(steps)
     )
@@ -2737,7 +3073,7 @@ def build_progress_card(
             {
                 "type": "Container",
                 "id": "octo-execution-trace-header",
-                "style": "emphasis",
+                "style": _TRACE_TONE_STYLES.get(status_tone, "emphasis"),
                 "bleed": True,
                 "spacing": "None",
                 "items": [{
@@ -2750,9 +3086,23 @@ def build_progress_card(
                 "type": "Container",
                 "id": "timeline_detail",
                 "isVisible": detail_visible,
-                "spacing": "Medium",
+                "spacing": "Small" if hidden or not steps else "Medium",
                 "items": trace_items,
             },
+            *(
+                [
+                    {
+                        "type": "Container",
+                        "id": "collapsed_steps",
+                        "isVisible": True,
+                        "spacing": "Medium",
+                        "items": collapsed_items,
+                    }
+                ]
+                if collapsed_items
+                else []
+            ),
+            *toggle_bar,
         ],
         "metadata": {"octo_layout": "agent_progress_v1"},
     }

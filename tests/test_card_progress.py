@@ -901,9 +901,29 @@ def test_fallback_progress_matches_openclaw_group_window_and_terminal_collapse()
     detail = rendered.card["body"][1]
     assert detail["id"] == "timeline_detail"
     assert detail["isVisible"] is False
-    toggle_json = str(rendered.card["body"][0])
-    assert "收起执行详情" in toggle_json
-    assert "展开执行详情" in toggle_json
+    # The hidden-step notice opens the panel, so it keeps the small lead.
+    assert detail["spacing"] == "Small"
+    assert detail["items"][0]["text"] == "已隐藏前 2 个步骤"
+    assert detail["items"][1]["spacing"] == "Medium"
+    collapsed = rendered.card["body"][2]
+    assert (collapsed["id"], collapsed["isVisible"]) == ("collapsed_steps", True)
+    summary = collapsed["items"][0]["columns"][1]["items"][0]
+    assert summary["type"] == "RichTextBlock"
+    assert [run["text"] for run in summary["inlines"]] == [
+        "读取文件 × 12",
+        "  总计 1.2s · 最近：/tmp/13.txt",
+    ]
+    assert summary["inlines"][1]["fontType"] == "Monospace"
+    collapse, expand = rendered.card["body"][3], rendered.card["body"][4]
+    assert (collapse["id"], collapse["isVisible"]) == ("btn_collapse_trace", False)
+    assert (expand["id"], expand["isVisible"]) == ("btn_expand_trace", True)
+    assert collapse["actions"][0]["title"] == "收起执行详情"
+    assert expand["actions"][0]["targetElements"] == [
+        {"elementId": "timeline_detail", "isVisible": True},
+        {"elementId": "collapsed_steps", "isVisible": False},
+        {"elementId": "btn_collapse_trace", "isVisible": True},
+        {"elementId": "btn_expand_trace", "isVisible": False},
+    ]
 
 
 def test_progress_renderer_uses_reasoning_only_when_public_thought_is_visible() -> None:
@@ -1430,23 +1450,195 @@ def test_reasoning_process_renderer_uses_collapsed_terminal_trace() -> None:
     body = rendered.card["body"]
     assert rendered.card["metadata"] == {"octo_layout": "agent_progress_v1"}
     assert body[0]["id"] == "octo-execution-trace-header"
-    assert body[0]["style"] == "emphasis"
+    # A finished run tints its header green; the state is legible before the
+    # first word is read.
+    assert body[0]["style"] == "good"
     assert body[1]["id"] == "trace_panel"
     assert body[1]["isVisible"] is False
     assert body[2]["id"] == "collapsed_panel"
     assert body[2]["isVisible"] is True
-    toggle = body[3]["items"][0]["actions"][0]
-    assert toggle == {
+    collapse, expand = body[3], body[4]
+    assert (collapse["id"], collapse["isVisible"]) == ("btn_collapse_trace", False)
+    assert (expand["id"], expand["isVisible"]) == ("btn_expand_trace", True)
+    assert collapse["actions"][0]["title"] == "收起执行详情"
+    assert expand["actions"][0] == {
         "type": "Action.ToggleVisibility",
-        "id": "reasoning_toggle",
-        "title": "展开/收起执行详情",
-        "targetElements": ["trace_panel", "collapsed_panel"],
+        "id": "trace_expand",
+        "title": "展开执行详情",
+        "targetElements": [
+            {"elementId": "trace_panel", "isVisible": True},
+            {"elementId": "collapsed_panel", "isVisible": False},
+            {"elementId": "btn_collapse_trace", "isVisible": True},
+            {"elementId": "btn_expand_trace", "isVisible": False},
+        ],
     }
+    collapsed_row = body[2]["items"][0]
+    name, detail = collapsed_row["columns"][1]["items"]
+    assert (name["text"], name["weight"]) == ("读取文件", "Bolder")
+    assert detail["text"] == "…/src/cards.py · 已完成"
+    assert detail["fontType"] == "Monospace"
     assert rendered.plain.startswith("处理进度 · 已完成 · 2.0s · 1 个阶段 · 1 次工具调用")
     assert "Check the implementation." in rendered.plain
     assert "读取文件 · …/src/cards.py · 已完成" in rendered.plain
     assert "✦" not in str(rendered.card)
     assert "Reasoning" not in str(rendered.card)
+
+
+def test_reasoning_process_renderer_merges_step_lines_with_rich_text() -> None:
+    rendered = cards.build_reasoning_process_card(
+        phase="thinking",
+        tools=[
+            {"tool_name": "read", "status": "complete", "summary": "…/src/cards.py"},
+            {"tool_name": "bash", "status": "running", "summary": "pytest -q"},
+        ],
+        elapsed_ms=41_200,
+        reasoning_id="session-1:turn-1",
+        capabilities=cards.CardCapabilities(
+            available=True,
+            enabled=True,
+            elements=frozenset({
+                "TextBlock",
+                "RichTextBlock",
+                "Container",
+                "ColumnSet",
+                "ActionSet",
+            }),
+            actions=frozenset({"Action.ToggleVisibility"}),
+        ),
+    )
+
+    header, trace = rendered.card["body"][0], rendered.card["body"][1]
+    chip = header["items"][0]["columns"][1]["items"][0]
+    # The status reads as a marked tag rather than one more coloured word.
+    assert chip["type"] == "RichTextBlock"
+    assert chip["inlines"][0]["highlight"] is True
+    assert chip["inlines"][0]["color"] == "Accent"
+    done_row = trace["items"][0]["items"][0]
+    line = done_row["columns"][1]["items"][0]
+    assert line["type"] == "RichTextBlock"
+    name, detail = line["inlines"]
+    assert (name["text"], name["weight"]) == ("读取文件", "Bolder")
+    assert "color" not in name
+    assert detail["text"] == "  …/src/cards.py"
+    assert (detail["fontType"], detail["isSubtle"]) == ("Monospace", True)
+    live_row = trace["items"][-1]["items"][-1]
+    assert live_row["columns"][1]["items"][0]["inlines"][0]["color"] == "Accent"
+
+
+def test_reasoning_process_renderer_marks_the_running_step_and_drops_filler() -> None:
+    rendered = cards.build_reasoning_process_card(
+        phase="thinking",
+        tools=[
+            {
+                "tool_name": "__thinking__",
+                "status": "complete",
+                "thought": "Check the implementation.",
+            },
+            {
+                "tool_name": "read",
+                "status": "complete",
+                "summary": "…/src/cards.py",
+            },
+            {"tool_name": "__thinking__", "status": "complete", "thought": ""},
+            {"tool_name": "bash", "status": "running", "summary": "pytest -q"},
+        ],
+        elapsed_ms=41_200,
+        reasoning_id="session-1:turn-1",
+        capabilities=cards.CardCapabilities(
+            available=True,
+            enabled=True,
+            elements=frozenset({"TextBlock", "Container", "ColumnSet", "ActionSet"}),
+            actions=frozenset({"Action.ToggleVisibility"}),
+        ),
+    )
+
+    header, trace = rendered.card["body"][0], rendered.card["body"][1]
+    assert header["style"] == "accent"
+    meta = header["items"][0]["columns"][0]["items"][1]
+    assert meta["text"] == "41.2s · 2 个阶段 · 2 次工具调用"
+    assert trace["isVisible"] is True
+    live = trace["items"][-1]["items"][-1]
+    # The running step opens its own phase group, is marked by colour only, and
+    # ends the rail: no trailing pad, but the separator still runs beside it.
+    assert live["spacing"] == "Medium"
+    assert live["columns"][0]["items"][0]["text"] == "◉"
+    assert live["columns"][1]["separator"] is True
+    assert len(live["columns"][1]["items"]) == 2
+    assert live["columns"][1]["items"][0]["color"] == "Accent"
+    # A finished step keeps its own status colour, rides the rail with no row
+    # spacing, and carries the pad that leaves air before the next step.
+    done_row = trace["items"][0]["items"][1]
+    done_glyph = done_row["columns"][0]["items"][0]
+    assert done_glyph["text"] == "●"
+    assert done_glyph["color"] == "Good"
+    assert done_row["columns"][1]["separator"] is True
+    assert len(done_row["columns"][1]["items"]) == 3
+    card_text = str(rendered.card)
+    assert "正在分析…" not in card_text
+    assert card_text.count("正在处理…") == 0
+    assert rendered.plain.startswith("处理进度 · 进行中 · 41.2s · 2 个阶段 · 2 次工具调用")
+    assert "正在分析…" not in rendered.plain
+
+
+def test_trace_panels_carry_the_lead_air_a_first_row_cannot_draw() -> None:
+    # A container never draws spacing on its own first element, so a trace that
+    # opens with a step would otherwise sit flush under the header.
+    caps = cards.CardCapabilities(
+        available=True,
+        enabled=True,
+        elements=frozenset(
+            {"TextBlock", "Container", "ColumnSet", "ActionSet", "RichTextBlock"}
+        ),
+        actions=frozenset({"Action.ToggleVisibility"}),
+    )
+    rows_first = cards.build_reasoning_process_card(
+        phase="completed",
+        tools=[
+            {"tool_name": "bash", "status": "complete", "summary": "python3"},
+            {"tool_name": "read", "status": "complete", "summary": "…/src/cards.py"},
+        ],
+        elapsed_ms=39_700,
+        capabilities=caps,
+    )
+    trace, collapsed = rows_first.card["body"][1], rows_first.card["body"][2]
+    assert (trace["id"], collapsed["id"]) == ("trace_panel", "collapsed_panel")
+    assert trace["spacing"] == "Medium"
+    lead_row = trace["items"][0]["items"][0]
+    assert lead_row["type"] == "ColumnSet"
+    # The panel already drew that beat; asking twice would double the gap.
+    assert lead_row["spacing"] == "None"
+    assert collapsed["spacing"] == "Medium"
+
+    thought_first = cards.build_reasoning_process_card(
+        phase="completed",
+        tools=[
+            {"tool_name": "__thinking__", "status": "complete", "thought": "Ship it."},
+            {"tool_name": "bash", "status": "complete", "summary": "python3"},
+        ],
+        elapsed_ms=39_700,
+        capabilities=caps,
+    )
+    spoken = thought_first.card["body"][1]
+    # A thought opens this panel, so the row keeps its own leading beat.
+    assert spoken["spacing"] == "Small"
+    thought, row = spoken["items"][0]["items"][0], spoken["items"][0]["items"][1]
+    assert (thought["type"], row["type"]) == ("TextBlock", "ColumnSet")
+    assert row["spacing"] == "Medium"
+
+    fallback = cards.build_progress_card(
+        phase="completed",
+        tools=[
+            {"tool_name": "bash", "status": "complete", "summary": "python3"},
+            {"tool_name": "read", "status": "complete", "summary": "/tmp/1.txt"},
+        ],
+        elapsed_ms=2_000,
+        capabilities=caps,
+    )
+    detail, folded = fallback.card["body"][1], fallback.card["body"][2]
+    assert (detail["id"], folded["id"]) == ("timeline_detail", "collapsed_steps")
+    assert detail["spacing"] == "Medium"
+    assert detail["items"][0]["spacing"] == "None"
+    assert folded["spacing"] == "Medium"
 
 
 def test_reasoning_summary_preserves_public_thought_but_not_raw_tool_output() -> None:
